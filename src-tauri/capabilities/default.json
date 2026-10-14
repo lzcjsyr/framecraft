@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Local studio window; files are accessed by scoped native workspace commands.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}

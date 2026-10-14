@@ -1,0 +1,6 @@
+# Footage editing
+Choose cuts from indexed raw videos only, using source IDs and exact source in/out points. Respect transcript timing when available; avoid splitting words. Match reference beat functions rather than blindly copying durations. Cite which sampled frames or transcript lines justify each choice. Prefer clean straight cuts and coherent source audio. Images/audio may guide planning, but this renderer supports video clips only. Do not invent footage, voiceover, music, overlays, or transitions that the renderer cannot execute. Return a sequential timeline with captions as a sidecar SRT and explain evidence gaps. Keep clips within the probed source duration.
+
+## Rendering performance
+
+On macOS, use the native VideoToolbox hardware rendering path, optimized for Apple Silicon M-series media engines. Do not request libx264 or software video encoding on a Mac. The native renderer enforces hardware H.264 encoding and records the backend in output metadata. It requests hardware decoding and uses VideoToolbox scaling when supported by the installed FFmpeg. Audio processing, frame padding, caption files and final file assembly can still use CPU work; do not claim the entire pipeline is GPU-only. Respect the native renderer's supported operations.

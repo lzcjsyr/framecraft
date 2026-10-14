@@ -1,0 +1,2 @@
+# Story adaptation
+Preserve the reference's storytelling function and rhythm while developing original content for the user's topic, direction, audience, and platform. Produce a practical shot-by-shot script: time range, visual direction, spoken line, on-screen text, audio notes. Make the hook concrete, give each beat a purpose, and end with the requested audience action. Flag material or factual claims that need verification. Use the user's requested language.

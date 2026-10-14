@@ -1,0 +1,2 @@
+# Social pacing
+Prioritize an intelligible opening in the first three seconds, one idea per beat, readable captions, purposeful changes in shot scale, and a clear final action. Tighten repetition without changing meaning. Fast cutting is not a substitute for a coherent argument. Adapt rhythm to the selected platform and intended duration; treat target duration as guidance, not a reason to invent material.
