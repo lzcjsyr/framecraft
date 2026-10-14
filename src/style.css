@@ -2282,3 +2282,22 @@ details pre {
     flex-wrap: wrap;
   }
 }
+.adc-login {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+.adc-login > button {
+  align-self: flex-start;
+}
+.adc-login .cli-login-note,
+.adc-login .cli-login-error {
+  margin: 0;
+}
+.adc-login .cli-login-details {
+  margin: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}

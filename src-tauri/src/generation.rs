@@ -167,41 +167,9 @@ async fn request(
     let mut project = String::new();
     if kind == "image" && s.image_provider == "google_adc" {
         let adc = crate::credentials::adc()?;
-        project = if s.google_project.is_empty() {
-            adc["quota_project_id"].as_str().unwrap_or_default().into()
-        } else {
-            s.google_project.clone()
-        };
-        if project.is_empty()
-            || !project
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-        {
-            return Err("Enter your Google Cloud project ID in Settings".into());
-        }
-        let response = client
-            .post("https://oauth2.googleapis.com/token")
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("client_id", adc["client_id"].as_str().unwrap()),
-                ("client_secret", adc["client_secret"].as_str().unwrap()),
-                ("refresh_token", adc["refresh_token"].as_str().unwrap()),
-            ])
-            .send()
-            .await
-            .map_err(|_| "Cannot refresh Google Cloud login; check your network")?;
-        if !response.status().is_success() {
-            return Err("Google Cloud login expired or was rejected. Run gcloud auth application-default login.".into());
-        }
-        let v: Value = response
-            .json()
-            .await
-            .map_err(|_| "Invalid Google Cloud authentication response")?;
-        adc_token = v["access_token"]
-            .as_str()
-            .filter(|v| !v.is_empty())
-            .ok_or("Google returned no access token")?
-            .into();
+        project = crate::credentials::adc_project(&adc, &s.google_project)?
+            .ok_or("Enter your Google Cloud project ID in Settings")?;
+        adc_token = crate::credentials::refresh_adc(&client, &adc).await?.token;
     }
     let req = if kind == "voice" {
         client

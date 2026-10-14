@@ -170,9 +170,192 @@ pub fn adc() -> Result<serde_json::Value, String> {
     Ok(v)
 }
 
+pub struct AdcAccess {
+    pub token: String,
+    pub expires_in: u64,
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdcStatus {
+    pub logged_in: bool,
+    pub project: Option<String>,
+    pub checked: u64,
+    pub expires_at: Option<u64>,
+    pub error: Option<String>,
+}
+pub fn adc_project(adc: &serde_json::Value, configured: &str) -> Result<Option<String>, String> {
+    let project = if configured.trim().is_empty() {
+        adc["quota_project_id"].as_str().unwrap_or_default().trim()
+    } else {
+        configured.trim()
+    };
+    if project.len() > 100
+        || !project
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    {
+        return Err("Enter a valid Google Cloud project ID".into());
+    }
+    Ok((!project.is_empty()).then(|| project.to_owned()))
+}
+fn adc_access(success: bool, value: &serde_json::Value) -> Result<AdcAccess, String> {
+    if !success {
+        return Err(match value["error"].as_str() {
+            Some("invalid_grant" | "invalid_client" | "unauthorized_client") =>
+                "Google ADC login expired or was revoked. Run gcloud auth application-default login.",
+            _ => "Google rejected ADC verification. Check your network and Google Cloud login, then retry.",
+        }.into());
+    }
+    let token = value["access_token"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty());
+    let expires = value["expires_in"].as_u64().filter(|n| *n > 0);
+    if !value["token_type"]
+        .as_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case("Bearer"))
+    {
+        return Err("Google returned an invalid ADC access token".into());
+    }
+    Ok(AdcAccess {
+        token: token.ok_or("Google returned no ADC access token")?.into(),
+        expires_in: expires.ok_or("Google returned an expired or invalid ADC access token")?,
+    })
+}
+/// Shared by verification and generation. Never return credentials in diagnostics.
+pub async fn refresh_adc(
+    client: &reqwest::Client,
+    adc: &serde_json::Value,
+) -> Result<AdcAccess, String> {
+    let mut response = client
+        .post("https://oauth2.googleapis.com/token")
+        .timeout(std::time::Duration::from_secs(20))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            (
+                "client_id",
+                adc["client_id"].as_str().ok_or("Invalid ADC client ID")?,
+            ),
+            (
+                "client_secret",
+                adc["client_secret"]
+                    .as_str()
+                    .ok_or("Invalid ADC client credentials")?,
+            ),
+            (
+                "refresh_token",
+                adc["refresh_token"].as_str().ok_or("Invalid ADC login")?,
+            ),
+        ])
+        .send()
+        .await
+        .map_err(|_| "Cannot verify Google ADC login. Check your network and retry.")?;
+    let success = response.status().is_success();
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Google ADC verification was interrupted")?
+    {
+        if body.len() + chunk.len() > 65536 {
+            return Err("Invalid Google ADC authentication response".into());
+        }
+        body.extend(chunk);
+    }
+    let value =
+        serde_json::from_slice(&body).map_err(|_| "Invalid Google ADC authentication response")?;
+    adc_access(success, &value)
+}
+pub async fn inspect_adc(configured_project: &str) -> AdcStatus {
+    let mut status = AdcStatus {
+        logged_in: false,
+        project: None,
+        checked: crate::model::now(),
+        expires_at: None,
+        error: None,
+    };
+    let result = async {
+        let adc = adc()?;
+        status.project = adc_project(&adc, configured_project)?;
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(8))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| "Cannot initialize ADC verification")?;
+        refresh_adc(&client, &adc).await
+    }
+    .await;
+    status.checked = crate::model::now();
+    match result {
+        Ok(access) => {
+            status.logged_in = true;
+            status.expires_at = Some(status.checked.saturating_add(access.expires_in));
+        }
+        Err(error) => status.error = Some(error),
+    }
+    status
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn adc_verification_fails_closed_and_does_not_return_secrets() {
+        let valid = serde_json::json!({"access_token":"fixture-secret-token","expires_in":3600,"token_type":"Bearer"});
+        assert!(adc_access(true, &valid).is_ok());
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"error":"invalid_grant"}),
+            serde_json::json!({"access_token":"","expires_in":3600,"token_type":"Bearer"}),
+            serde_json::json!({"access_token":"secret","expires_in":0,"token_type":"Bearer"}),
+            serde_json::json!({"access_token":"secret","expires_in":3600,"token_type":"Basic"}),
+        ] {
+            assert!(adc_access(true, &invalid).is_err());
+        }
+        let error = adc_access(
+            false,
+            &serde_json::json!({"error":"invalid_grant","error_description":"private-token"}),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("gcloud auth application-default login"));
+        assert!(!error.contains("private-token"));
+        let status = AdcStatus {
+            logged_in: true,
+            project: None,
+            checked: 10,
+            expires_at: Some(3610),
+            error: None,
+        };
+        assert!(!serde_json::to_string(&status)
+            .unwrap()
+            .contains("access_token"));
+        assert_eq!(
+            adc_project(&serde_json::json!({"quota_project_id":"quota-project"}), "")
+                .unwrap()
+                .as_deref(),
+            Some("quota-project")
+        );
+        assert_eq!(
+            adc_project(&valid, " override-project ")
+                .unwrap()
+                .as_deref(),
+            Some("override-project")
+        );
+        assert!(adc_project(&valid, "bad/project").is_err());
+        assert!(adc_project(&valid, "").unwrap().is_none());
+    }
+    #[test]
+    #[ignore = "Checks the existing Google ADC login over HTTPS; no model requests or Keychain access"]
+    fn real_adc_login_status() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let status = runtime.block_on(inspect_adc(""));
+        assert!(status.logged_in, "{}", status.error.unwrap_or_default());
+        assert!(status.expires_at.unwrap() > status.checked);
+        println!("Google ADC login verified; token remains in native memory");
+    }
     #[test]
     fn a_denied_vault_read_is_not_repeated_until_explicit_retry() {
         let reads = std::cell::Cell::new(0);

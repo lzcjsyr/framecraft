@@ -1,5 +1,19 @@
 import type { Lang } from "./types";
 export const copy = {
+  verifyAdc: ["Verify ADC login", "验证 ADC 登录"],
+  adcNotChecked: ["ADC login not verified", "尚未验证 ADC 登录"],
+  checkingAdc: ["Verifying ADC login…", "正在验证 ADC 登录…"],
+  adcSignedIn: ["ADC login valid", "ADC 登录有效"],
+  adcCheckFailed: ["ADC verification failed", "ADC 验证失败"],
+  adcCheckNote: [
+    "Checks login by refreshing an access token. No image generation, model permission, or quota checks.",
+    "通过刷新访问令牌验证登录；不生成图片，不检查模型权限或额度。",
+  ],
+  adcNoProject: [
+    "Set a project ID before generating images.",
+    "生成图像前请设置项目 ID。",
+  ],
+  expiresAt: ["Token expires", "令牌有效期至"],
   voiceIdRequired: [
     "Set your voice ID in Connections",
     "请在连接设置中填写自己的音色 ID",

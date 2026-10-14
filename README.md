@@ -4,7 +4,7 @@
 
 - 分析对标视频的画面、文案与叙事结构，按新主题生成脚本。
 - 按文件夹管理工作空间，从原始素材生成可审阅的剪辑方案，导出 MP4 和 SRT。
-- 使用 Claude Code 本地登录或兼容 Anthropic 的 API，可验证 CLI 登录状态。
+- 使用 Claude Code 本地登录或兼容 Anthropic 的 API，可验证 CLI 和 Google ADC 登录状态。
 - 支持字节跳动配音、Seedream 图像生成，以及 Google Vertex AI 密钥或本地 ADC 登录。
 - Mac 使用 VideoToolbox 硬件编码，支持时启用硬件缩放；密钥保存在系统凭据库。
 

@@ -1,8 +1,16 @@
-import { useEffect, useState } from "react";
-import { FolderOpen, KeyRound, LoaderCircle, Sparkles } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  Check,
+  FolderOpen,
+  KeyRound,
+  LoaderCircle,
+  RefreshCw,
+  Sparkles,
+  TriangleAlert,
+} from "lucide-react";
 import { call, date, mediaUrl, seconds } from "./api";
 import { t } from "./i18n";
-import type { GenerationSettings, Lang, Workspace } from "./types";
+import type { AdcStatus, GenerationSettings, Lang, Workspace } from "./types";
 
 export const providerNames = [
   "BYTEDANCE_TTS_API_KEY",
@@ -10,6 +18,116 @@ export const providerNames = [
   "GOOGLE_CLOUD_API_KEY",
 ] as const;
 export type ProviderStatus = Record<string, boolean>;
+function AdcLoginCheck({
+  lang,
+  project,
+  busy,
+}: {
+  lang: Lang;
+  project: string;
+  busy: boolean;
+}) {
+  const tr = (k: Parameters<typeof t>[1]) => t(lang, k);
+  const [result, setResult] = useState<AdcStatus | null>(null);
+  const [checking, setChecking] = useState(false);
+  const revision = useRef(0);
+  useEffect(() => {
+    revision.current += 1;
+    setResult(null);
+    setChecking(false);
+    return () => {
+      revision.current += 1;
+    };
+  }, [project]);
+  async function verify() {
+    const request = ++revision.current;
+    setChecking(true);
+    setResult(null);
+    try {
+      const next = await call<AdcStatus>("adc_status", {
+        googleProject: project,
+      });
+      if (request === revision.current) setResult(next);
+    } catch (error) {
+      if (request === revision.current)
+        setResult({
+          loggedIn: false,
+          project: null,
+          checked: Date.now() / 1000,
+          expiresAt: null,
+          error: String(error),
+        });
+    } finally {
+      if (request === revision.current) setChecking(false);
+    }
+  }
+  return (
+    <div className="cli-login adc-login">
+      <div
+        className={`cli-login-status ${result?.loggedIn ? "verified" : ""}`}
+        role="status"
+        aria-live="polite"
+      >
+        {checking ? (
+          <LoaderCircle size={18} className="spin" />
+        ) : result?.loggedIn ? (
+          <Check size={18} />
+        ) : result ? (
+          <TriangleAlert size={18} />
+        ) : (
+          <KeyRound size={18} />
+        )}
+        <div>
+          <strong>
+            {tr(
+              checking
+                ? "checkingAdc"
+                : result
+                  ? result.loggedIn
+                    ? "adcSignedIn"
+                    : "adcCheckFailed"
+                  : "adcNotChecked",
+            )}
+          </strong>
+          {result?.project ? <small>{result.project}</small> : null}
+        </div>
+      </div>
+      <button
+        className="secondary small"
+        disabled={busy || checking}
+        onClick={verify}
+      >
+        {checking ? (
+          <LoaderCircle size={15} className="spin" />
+        ) : (
+          <RefreshCw size={15} />
+        )}
+        {tr("verifyAdc")}
+      </button>
+      <p className="cli-login-note">{tr("adcCheckNote")}</p>
+      {result?.error ? (
+        <p className="cli-login-error" role="alert">
+          {result.error}
+        </p>
+      ) : null}
+      {result?.loggedIn && !result.project ? (
+        <p className="cli-login-note">{tr("adcNoProject")}</p>
+      ) : null}
+      {result ? (
+        <div className="cli-login-details">
+          <small>
+            {tr("checkedAt")} · {date(result.checked, lang)}
+          </small>
+          {result.expiresAt ? (
+            <small>
+              {tr("expiresAt")} · {date(result.expiresAt, lang)}
+            </small>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
 export function ProviderFields({
   lang,
   value,
@@ -137,18 +255,22 @@ export function ProviderFields({
             </select>
           </label>
           {value.imageProvider === "google_adc" ? (
-            <label>
-              {tr("googleProject")}
-              <input
-                disabled={busy}
-                value={value.googleProject}
-                onChange={(e) => change("googleProject", e.target.value)}
+            <>
+              <label>
+                {tr("googleProject")}
+                <input
+                  disabled={busy}
+                  value={value.googleProject}
+                  onChange={(e) => change("googleProject", e.target.value)}
+                />
+                <small>{tr("googleProjectNote")}</small>
+              </label>
+              <AdcLoginCheck
+                lang={lang}
+                project={value.googleProject}
+                busy={busy}
               />
-              <small>{tr("googleProjectNote")}</small>
-              <small>
-                {tr(status.GOOGLE_ADC ? "loginFound" : "loginNeeded")}
-              </small>
-            </label>
+            </>
           ) : (
             keyInput(
               value.imageProvider === "doubao"

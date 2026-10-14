@@ -169,3 +169,11 @@ export interface CliStatus {
   checked: number;
   error: string | null;
 }
+
+export interface AdcStatus {
+  loggedIn: boolean;
+  project: string | null;
+  checked: number;
+  expiresAt: number | null;
+  error: string | null;
+}

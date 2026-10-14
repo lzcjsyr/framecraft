@@ -448,6 +448,10 @@ async fn generate_asset(
     .await
 }
 #[tauri::command]
+async fn adc_status(google_project: String) -> credentials::AdcStatus {
+    credentials::inspect_adc(&google_project).await
+}
+#[tauri::command]
 async fn cli_status(claude_path: String) -> Result<CliStatus, String> {
     work(move || Ok(tools::inspect_cli(&claude_path))).await
 }
@@ -652,6 +656,7 @@ fn main() {
             save_settings,
             diagnostics,
             cli_status,
+            adc_status,
             provider_status,
             unlock_provider_keys,
             import_provider_keys,
