@@ -9,11 +9,20 @@
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri",
     "test": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "test:media": "cargo test --manifest-path src-tauri/Cargo.toml real_media_pipeline -- --ignored"
+    "test:media": "cargo test --manifest-path src-tauri/Cargo.toml real_media_pipeline -- --ignored",
+    "test:mixed": "cargo test --manifest-path src-tauri/Cargo.toml real_mixed_assets -- --ignored --nocapture",
+    "test:speech": "cargo test --manifest-path src-tauri/Cargo.toml real_speech_roundtrip -- --ignored --nocapture",
+    "test:live": "cargo test --manifest-path src-tauri/Cargo.toml real_creation_workflow -- --ignored --nocapture",
+    "test:folder": "cargo test --manifest-path src-tauri/Cargo.toml real_folder_creation_workflow -- --ignored --nocapture",
+    "test:conversation": "cargo test --manifest-path src-tauri/Cargo.toml real_conversation_editing -- --ignored --nocapture",
+    "test:local-agent": "cargo test --manifest-path src-tauri/Cargo.toml real_local_conversation -- --ignored --nocapture",
+    "test:seedream": "cargo test --manifest-path src-tauri/Cargo.toml real_seedream_provider -- --ignored --nocapture"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-dialog": "^2.4.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

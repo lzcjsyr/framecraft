@@ -1,2 +1,5 @@
 # Story adaptation
-Preserve the reference's storytelling function and rhythm while developing original content for the user's topic, direction, audience, and platform. Produce a practical shot-by-shot script: time range, visual direction, spoken line, on-screen text, audio notes. Make the hook concrete, give each beat a purpose, and end with the requested audience action. Flag material or factual claims that need verification. Use the user's requested language.
+
+Build an original, practical scene sequence for the user's prompt, audience, and intended duration. When a reference exists, borrow its storytelling function and rhythm without copying identifying slogans or unsupported claims. When there is no reference, develop the story directly from the guidance and assets.
+
+Give each scene a purpose, a usable visual, and concise narration when requested. Keep any on-screen copy within the renderer's actual caption capabilities. Flag factual claims that need verification. Use the requested output language and the current task's storyboard schema.

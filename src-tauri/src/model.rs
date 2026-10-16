@@ -20,6 +20,11 @@ pub struct Brief {
     pub language: String,
     pub duration: u32,
     pub aspect: String,
+    #[serde(default = "default_narration")]
+    pub narration: bool,
+}
+fn default_narration() -> bool {
+    true
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,7 +107,7 @@ pub struct Artifact {
     pub run_id: String,
     pub data: Value,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Run {
     pub id: String,
@@ -114,6 +119,23 @@ pub struct Run {
     pub logs: Vec<String>,
     pub artifact_id: Option<String>,
     pub input_revision: u64,
+    #[serde(default)]
+    pub base_artifact_id: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessage {
+    pub id: String,
+    pub role: String,
+    pub text: String,
+    pub run_id: String,
+    pub created: u64,
+    pub artifact_id: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AgentSession {
+    pub id: String,
+    pub connection: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -127,12 +149,19 @@ pub struct Workspace {
     pub revision: u64,
     pub brief: Brief,
     pub reference: Option<Media>,
-    pub raw_folder: Option<String>,
+    #[serde(default, alias = "rawFolder")]
+    pub assets_folder: Option<String>,
     pub media: Vec<Media>,
     pub skills: Vec<Skill>,
     pub selected_skills: Vec<String>,
     pub artifacts: Vec<Artifact>,
     pub runs: Vec<Run>,
+    #[serde(default)]
+    pub conversation: Vec<ChatMessage>,
+    #[serde(default)]
+    pub agent_session: Option<AgentSession>,
+    #[serde(default)]
+    pub terminal_session: Option<AgentSession>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,9 +187,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            mode: "local".into(),
-            base_url: "https://api.anthropic.com".into(),
-            model: "sonnet".into(),
+            mode: "mimo".into(),
+            base_url: "https://api.xiaomimimo.com/anthropic".into(),
+            model: "mimo-v2.5".into(),
             claude_path: String::new(),
             ffmpeg_path: String::new(),
             ffprobe_path: String::new(),
@@ -184,6 +213,12 @@ pub struct Clip {
     pub beat: String,
     pub reason: String,
     pub caption: String,
+    #[serde(default)]
+    pub audio_source_id: Option<String>,
+    #[serde(default)]
+    pub audio_start: f64,
+    #[serde(default)]
+    pub fit_audio: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,13 +266,13 @@ pub struct GenerationSettings {
 impl Default for GenerationSettings {
     fn default() -> Self {
         Self {
-            voice: String::new(),
-            voice_model: "seed-tts-2.0-standard".into(),
+            voice: "mimo_default".into(),
+            voice_model: "mimo-v2.5-tts".into(),
             speech_rate: 0,
             emotion: "neutral".into(),
-            image_provider: "doubao".into(),
-            image_model: "doubao-seedream-5-0-pro-260628".into(),
-            image_size: "2048x2048".into(),
+            image_provider: "google_adc".into(),
+            image_model: "gemini-3.1-flash-image".into(),
+            image_size: "2560x1536".into(),
             google_project: String::new(),
         }
     }

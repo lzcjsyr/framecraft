@@ -1,6 +1,9 @@
 # Footage editing
-Choose cuts from indexed raw videos only, using source IDs and exact source in/out points. Respect transcript timing when available; avoid splitting words. Match reference beat functions rather than blindly copying durations. Cite which sampled frames or transcript lines justify each choice. Prefer clean straight cuts and coherent source audio. Images/audio may guide planning, but this renderer supports video clips only. Do not invent footage, voiceover, music, overlays, or transitions that the renderer cannot execute. Return a sequential timeline with captions as a sidecar SRT and explain evidence gaps. Keep clips within the probed source duration.
 
-## Rendering performance
+Prefer supplied video and image assets that support the requested story. Use real source IDs and keep video in/out points within the probed source duration. A still image starts at zero and can be held for the scene duration. When a needed visual is missing, provide a specific image prompt so the configured image API can create it. Do not treat the reference video as output footage unless it was also imported as an asset.
 
-On macOS, use the native VideoToolbox hardware rendering path, optimized for Apple Silicon M-series media engines. Do not request libx264 or software video encoding on a Mac. The native renderer enforces hardware H.264 encoding and records the backend in output metadata. It requests hardware decoding and uses VideoToolbox scaling when supported by the installed FFmpeg. Audio processing, frame padding, caption files and final file assembly can still use CPU work; do not claim the entire pipeline is GPU-only. Respect the native renderer's supported operations.
+Use supplied audio as a continuous soundtrack when appropriate. Otherwise, when narration is enabled, write short original narration for MiMo to speak per scene. Leave narration empty when disabled. ASR transcripts provide approximate segment timing, not word timings. Do not invent observed speech or claim precise synchronization from segment transcripts.
+
+The renderer supports straight cuts, held images, aspect fitting, original audio or a separate soundtrack/narration, and captions as a sidecar SRT. It does not support effects, animated overlays, transitions, or generated music. Follow the current task's storyboard schema and explain unsupported requests in warnings.
+
+On macOS, use the native VideoToolbox rendering path. Audio processing, padding, caption files, and assembly can still use CPU work; do not claim the entire pipeline is GPU-only.

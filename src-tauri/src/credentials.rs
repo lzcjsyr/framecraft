@@ -1,8 +1,9 @@
-//! Provider secrets never leave native memory or the operating system vault.
+//! Development reads and writes .env; release builds keep the system vault.
 use keyring::{Entry, Error};
 use std::{collections::BTreeMap, sync::Mutex};
 
-pub const PROVIDERS: [&str; 4] = [
+pub const PROVIDERS: [&str; 5] = [
+    "MIMO_API_KEY",
     "AGENT_API_KEY",
     "BYTEDANCE_TTS_API_KEY",
     "VOLCENGINE_API_KEY",
@@ -11,6 +12,7 @@ pub const PROVIDERS: [&str; 4] = [
 const SERVICE: &str = "com.framecraft.studio.media-keys";
 const REFERENCE: &str = "com.book2video.studio.provider-keys";
 static CACHE: Mutex<Option<Result<BTreeMap<String, String>, String>>> = Mutex::new(None);
+static MIMO_CACHE: Mutex<Option<VaultResult>> = Mutex::new(None);
 
 fn load(service: &str) -> Result<BTreeMap<String, String>, String> {
     let entry =
@@ -54,14 +56,30 @@ fn cached() -> VaultResult {
     })
 }
 /// Only an explicit user retry may re-open a denied vault read.
-pub fn retry() -> Result<BTreeMap<String, bool>, String> {
+pub fn retry(provider: &str) -> Result<BTreeMap<String, bool>, String> {
     {
         let mut cache = CACHE.lock().map_err(|_| "Credential store unavailable")?;
         if cache.as_ref().is_some_and(Result::is_err) {
             *cache = None;
         }
     }
-    status()
+    {
+        let mut cache = MIMO_CACHE
+            .lock()
+            .map_err(|_| "Credential store unavailable")?;
+        if cache.as_ref().is_some_and(Result::is_err) {
+            *cache = None;
+        }
+    }
+    let mut status = BTreeMap::from([("MIMO_API_KEY".into(), optional("MIMO_API_KEY")?.is_some())]);
+    if provider == "doubao" {
+        status.insert(
+            "VOLCENGINE_API_KEY".into(),
+            optional("VOLCENGINE_API_KEY")?.is_some(),
+        );
+    }
+    status.insert("GOOGLE_ADC".into(), adc().is_ok());
+    Ok(status)
 }
 fn write(keys: &BTreeMap<String, String>) -> Result<(), String> {
     Entry::new(SERVICE, "provider-keys")
@@ -70,11 +88,56 @@ fn write(keys: &BTreeMap<String, String>) -> Result<(), String> {
         .map_err(|_| "Cannot save keys in the system credential store".into())
 }
 pub fn optional(name: &str) -> Result<Option<String>, String> {
+    if let Ok(value) = std::env::var(name) {
+        if !value.trim().is_empty() {
+            return Ok(Some(value));
+        }
+    }
+    if let Some(path) = crate::local_env::path() {
+        return Ok(crate::local_env::read(&path)?.remove(name));
+    }
+    if name == "MIMO_API_KEY" {
+        // New providers have their own item, so saving MiMo never needs to read legacy keys.
+        let mut cache = MIMO_CACHE
+            .lock()
+            .map_err(|_| "Credential store unavailable")?;
+        return Ok(load_once(&mut cache, || {
+            let entry = Entry::new(SERVICE, name).map_err(|_| "Cannot access MiMo credentials")?;
+            match entry.get_password() {
+                Ok(key) => Ok(BTreeMap::from([(name.into(), key)])),
+                Err(Error::NoEntry) => Ok(BTreeMap::new()),
+                Err(_) => Err("Unlock the system credential store and retry MiMo access".into()),
+            }
+        })?
+        .remove(name)
+        .filter(|key| !key.is_empty()));
+    }
     Ok(cached()?.remove(name).filter(|k| !k.is_empty()))
 }
-pub fn save(changes: BTreeMap<String, String>) -> Result<BTreeMap<String, bool>, String> {
+pub fn save(mut changes: BTreeMap<String, String>) -> Result<BTreeMap<String, bool>, String> {
     if changes.keys().any(|k| !PROVIDERS.contains(&k.as_str())) {
         return Err("Unknown media provider".into());
+    }
+    if let Some(path) = crate::local_env::path() {
+        crate::local_env::save(&path, &changes)?;
+        return status();
+    }
+    changes.retain(|_, value| !value.trim().is_empty());
+    let mut saved = BTreeMap::new();
+    if let Some(value) = changes.remove("MIMO_API_KEY") {
+        let key = value.trim().to_owned();
+        Entry::new(SERVICE, "MIMO_API_KEY")
+            .map_err(|_| "Cannot access MiMo credentials")?
+            .set_password(&key)
+            .map_err(|_| "Cannot save MiMo in the system credential store")?;
+        *MIMO_CACHE
+            .lock()
+            .map_err(|_| "Credential store unavailable")? =
+            Some(Ok(BTreeMap::from([("MIMO_API_KEY".into(), key)])));
+        saved.insert("MIMO_API_KEY".into(), true);
+    }
+    if changes.is_empty() {
+        return Ok(saved);
     }
     let mut keys = cached()?;
     for (name, value) in changes {
@@ -87,24 +150,42 @@ pub fn save(changes: BTreeMap<String, String>) -> Result<BTreeMap<String, bool>,
     status()
 }
 pub fn status() -> Result<BTreeMap<String, bool>, String> {
+    if let Some(path) = crate::local_env::path() {
+        let keys = crate::local_env::read(&path)?;
+        let mut status = PROVIDERS
+            .iter()
+            .map(|key| {
+                (
+                    key.to_string(),
+                    std::env::var(key).is_ok_and(|value| !value.trim().is_empty())
+                        || keys.contains_key(*key),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        status.insert("GOOGLE_ADC".into(), adc().is_ok());
+        return Ok(status);
+    }
     let keys = cached()?;
     let mut status: BTreeMap<String, bool> = PROVIDERS
         .iter()
         .map(|k| (k.to_string(), keys.get(*k).is_some_and(|v| !v.is_empty())))
         .collect();
     status.insert("GOOGLE_ADC".into(), adc().is_ok());
+    status.insert("MIMO_API_KEY".into(), optional("MIMO_API_KEY")?.is_some());
     Ok(status)
 }
 pub fn key(name: &str) -> Result<String, String> {
-    cached()?
-        .remove(name)
+    optional(name)?
         .filter(|k| !k.is_empty())
-        .ok_or_else(|| format!("Save {name} in Settings first"))
+        .ok_or_else(|| format!("Set {name} in the local .env file or Settings"))
 }
 /// Read the reference app's vault; never migrate or delete its credentials.
 pub fn import_reference() -> Result<BTreeMap<String, bool>, String> {
+    if crate::local_env::path().is_some() {
+        return status();
+    }
     let existing = cached()?;
-    let media_names = &PROVIDERS[1..];
+    let media_names = &["VOLCENGINE_API_KEY", "GOOGLE_CLOUD_API_KEY"];
     if media_names.iter().all(|name| existing.contains_key(*name)) {
         return status();
     }

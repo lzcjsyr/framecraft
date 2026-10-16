@@ -20,6 +20,7 @@ pub const PROVIDER_ENV: &[&str] = &[
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
@@ -76,13 +77,22 @@ pub fn command(p: &Path) -> Command {
 }
 // Drains both pipes concurrently, so large tool output cannot deadlock before timeout/cancel.
 pub fn execute(
+    c: Command,
+    job: &Job,
+    timeout: u64,
+    on_line: impl FnMut(&str),
+) -> Result<(bool, String, String), String> {
+    execute_with_input(c, job, timeout, None, on_line)
+}
+pub fn execute_with_input(
     mut c: Command,
     job: &Job,
     timeout: u64,
+    input: Option<std::fs::File>,
     mut on_line: impl FnMut(&str),
 ) -> Result<(bool, String, String), String> {
     job.check()?;
-    c.stdin(Stdio::null())
+    c.stdin(input.map(Stdio::from).unwrap_or_else(Stdio::null))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = c.spawn().map_err(|e| format!("Cannot start tool: {e}"))?;
@@ -218,6 +228,53 @@ pub fn required(name: &str, path: &str) -> Result<PathBuf, String> {
         format!("{name} was not found. Install it or set its executable path in Settings.")
     })
 }
+// Pin npm updates to the selected CLI's prefix, even when PATH has another Node.
+pub fn cli_update_command(program: &Path) -> Result<Command, String> {
+    let real = program.canonicalize().map_err(|e| e.to_string())?;
+    for package in real.ancestors() {
+        if package.file_name().is_some_and(|n| n == "claude-code")
+            && package
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "@anthropic-ai")
+        {
+            let modules = package
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("Invalid npm installation")?;
+            let mut prefix = modules.parent().ok_or("Invalid npm prefix")?;
+            if prefix.file_name().is_some_and(|n| n == "lib") {
+                prefix = prefix.parent().ok_or("Invalid npm prefix")?;
+            }
+            let mut cmd = command(&required("npm", "")?);
+            cmd.args([
+                "install",
+                "--global",
+                "@anthropic-ai/claude-code@latest",
+                "--prefix",
+            ])
+            .arg(prefix);
+            clean_provider(&mut cmd);
+            return Ok(cmd);
+        }
+    }
+    let parts: Vec<_> = real.iter().collect();
+    if let Some(i) = parts.iter().position(|s| *s == "Caskroom") {
+        if let Some(cask) = parts
+            .get(i + 1)
+            .filter(|n| **n == "claude-code" || **n == "claude-code@latest")
+        {
+            let mut cmd = command(&required("brew", "")?);
+            cmd.args(["upgrade", "--cask"]).arg(cask);
+            clean_provider(&mut cmd);
+            return Ok(cmd);
+        }
+    }
+    let mut cmd = command(program);
+    clean_provider(&mut cmd);
+    cmd.arg("update");
+    Ok(cmd)
+}
 pub fn clean_provider(c: &mut Command) {
     for name in PROVIDER_ENV {
         c.env_remove(name);
@@ -231,11 +288,34 @@ pub fn agent_command(
 ) -> Result<Command, String> {
     let mut cmd = command(program);
     clean_provider(&mut cmd);
-    if settings.mode == "api" {
+    if settings.mode == "api" || settings.mode == "mimo" {
         let key = secret.ok_or("Save your provider API key in Settings first")?;
-        cmd.env("ANTHROPIC_API_KEY", key)
-            .env("ANTHROPIC_AUTH_TOKEN", key)
-            .env("ANTHROPIC_BASE_URL", &settings.base_url);
+        cmd.env("ANTHROPIC_BASE_URL", &settings.base_url);
+        if settings.mode == "mimo" {
+            cmd.env("ANTHROPIC_AUTH_TOKEN", key)
+                .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+        } else {
+            cmd.env("ANTHROPIC_API_KEY", key);
+        }
+        for name in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        ] {
+            cmd.env(name, &settings.model);
+        }
+    }
+    // Media credentials are consumed by the native app, never by agent tools.
+    for name in [
+        "MIMO_API_KEY",
+        "AGENT_API_KEY",
+        "VOLCENGINE_API_KEY",
+        "GOOGLE_CLOUD_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    ] {
+        cmd.env_remove(name);
     }
     Ok(cmd)
 }
@@ -345,7 +425,11 @@ pub fn diagnose(s: &Settings) -> Diagnostics {
         key_saved: false,
         errors: vec![],
     };
-    match key() {
+    match if s.mode == "mimo" {
+        crate::credentials::optional("MIMO_API_KEY")
+    } else {
+        key()
+    } {
         Ok(k) => d.key_saved = k.is_some(),
         Err(e) => d.errors.push(e),
     }
@@ -366,6 +450,24 @@ pub fn small_text(p: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(unix)]
+    fn context_reaches_the_child_process_on_stdin_without_unicode_loss() {
+        let path = std::env::temp_dir().join(format!("framecraft-stdin-{}", id()));
+        let context = "Assets: /项目/素材\nGoal: 把结尾缩短。\n";
+        std::fs::write(&path, context).unwrap();
+        let (ok, output, _) = execute_with_input(
+            command(Path::new("/bin/cat")),
+            &Job::default(),
+            5,
+            Some(std::fs::File::open(&path).unwrap()),
+            |_| {},
+        )
+        .unwrap();
+        assert!(ok);
+        assert_eq!(output, context);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn cli_login_fails_closed_for_signed_out_api_auth_and_invalid_responses() {
         let mut status = CliStatus {
@@ -419,9 +521,18 @@ mod tests {
         let c = agent_command(Path::new("claude"), &settings, Some("test-key")).unwrap();
         let env: std::collections::HashMap<_, _> = c.get_envs().collect();
         assert_eq!(
-            env[std::ffi::OsStr::new("ANTHROPIC_AUTH_TOKEN")],
+            env[std::ffi::OsStr::new("ANTHROPIC_API_KEY")],
             Some(std::ffi::OsStr::new("test-key"))
         );
+        assert_eq!(env[std::ffi::OsStr::new("ANTHROPIC_AUTH_TOKEN")], None);
+        let mimo =
+            agent_command(Path::new("claude"), &Settings::default(), Some("test-key")).unwrap();
+        let mimo_env: std::collections::HashMap<_, _> = mimo.get_envs().collect();
+        assert_eq!(
+            mimo_env[std::ffi::OsStr::new("ANTHROPIC_AUTH_TOKEN")],
+            Some(std::ffi::OsStr::new("test-key"))
+        );
+        assert_eq!(mimo_env[std::ffi::OsStr::new("ANTHROPIC_API_KEY")], None);
         assert_eq!(
             env[std::ffi::OsStr::new("ANTHROPIC_BASE_URL")],
             Some(std::ffi::OsStr::new("https://provider.example"))
@@ -432,7 +543,10 @@ mod tests {
         assert!(agent_command(Path::new("claude"), &settings, None).is_err());
         let local = agent_command(
             Path::new("claude"),
-            &Settings::default(),
+            &Settings {
+                mode: "local".into(),
+                ..Default::default()
+            },
             Some("ignored-key"),
         )
         .unwrap();

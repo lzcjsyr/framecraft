@@ -1,2 +1,5 @@
 # Reference study
+
+Apply only when an optional reference video is supplied. Without a reference, skip reference analysis and create from the prompt and assets.
+
 Map the reference's hook, promise, narrative beats, shot choices, on-screen text, composition, pacing, transitions, sound, and call to action. Every observation needs a timestamp and an evidence source. Read the supplied frame images, not only the media manifest. Distinguish observed facts, transcript evidence, and inference. Sparse frames cannot prove exact cut points, motion, or sound. Never invent spoken words or music. Explain the transferable structure without copying identifying slogans or claiming to have listened to audio.

@@ -1,10 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod bridge;
 mod credentials;
 mod generation;
+mod local_env;
 mod media;
+mod mimo;
 mod model;
 mod pipeline;
 mod store;
+mod terminal;
 mod tools;
 use model::*;
 use serde_json::Value;
@@ -29,10 +33,13 @@ fn grant(app: &tauri::AppHandle, w: &Workspace) -> Result<(), String> {
     if let Some(r) = &w.reference {
         scope.allow_file(&r.path).map_err(|e| e.to_string())?;
     }
-    if let Some(raw) = &w.raw_folder {
+    if let Some(raw) = &w.assets_folder {
         scope
             .allow_directory(raw, true)
             .map_err(|e| e.to_string())?;
+    }
+    for media in &w.media {
+        scope.allow_file(&media.path).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -49,11 +56,19 @@ async fn app_data(app: tauri::AppHandle) -> Result<AppData, String> {
 async fn create_workspace(
     app: tauri::AppHandle,
     name: String,
-    folder: String,
+    folder: Option<String>,
 ) -> Result<Workspace, String> {
     work(move || {
         let s = app.state::<Studio>();
         let _g = s.gate.lock().unwrap();
+        let folder = match folder {
+            Some(folder) => folder,
+            None => {
+                let root = s.storage.join("workspaces").join(model::id());
+                std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+                root.to_string_lossy().into()
+            }
+        };
         let w = create(name, folder)?;
         let root = PathBuf::from(&w.root);
         let w = s.register(w, &root)?;
@@ -92,7 +107,7 @@ async fn open_workspace(app: tauri::AppHandle, folder: String) -> Result<Workspa
                     rebase(&mut f.path)
                 }
             }
-            if let Some(raw) = w.raw_folder.as_mut() {
+            if let Some(raw) = w.assets_folder.as_mut() {
                 rebase(raw)
             }
             for m in &mut w.media {
@@ -199,42 +214,44 @@ async fn import_reference(
     .await
 }
 #[tauri::command]
-async fn import_raw_folder(
+async fn set_assets_folder(
     app: tauri::AppHandle,
-    id: String,
+    id: Option<String>,
     folder: String,
 ) -> Result<Workspace, String> {
     work(move || {
-        let s = app.state::<Studio>();
-        let _g = s.gate.lock().unwrap();
-        s.idle(&id)?;
-        let mut w = s.load(&id)?;
-        let folder = PathBuf::from(folder)
-            .canonicalize()
-            .map_err(|e| e.to_string())?;
-        if !folder.is_dir() {
-            return Err("Choose a raw-material folder".into());
-        }
-        let mut items = media::scan(&folder)?;
-        if items.is_empty() {
-            return Err("The selected folder contains no supported media".into());
-        }
-        for m in &mut items {
-            if let Some(old) = w.media.iter().find(|old| {
-                old.path == m.path && old.bytes == m.bytes && old.modified == m.modified
-            }) {
-                m.id = old.id.clone();
-                if m.transcript.is_none() {
-                    m.transcript = old.transcript.clone()
-                }
-            }
-        }
-        items.extend(w.media.iter().filter(|m| m.role == "generated").cloned());
-        w.media = items;
-        w.raw_folder = Some(folder.to_string_lossy().into());
+        let folder = media::folder_path(Path::new(&folder))?;
+        let studio = app.state::<Studio>();
+        let _guard = studio.gate.lock().unwrap();
+        let mut w = if let Some(id) = id {
+            studio.idle(&id)?;
+            studio.load(&id)?
+        } else {
+            let root = studio.storage.join("workspaces").join(model::id());
+            std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+            let name = folder
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .chars()
+                .take(30)
+                .collect::<String>();
+            let w = create(
+                if name.is_empty() {
+                    "My video".into()
+                } else {
+                    name
+                },
+                root.to_string_lossy().into(),
+            )?;
+            studio.register(w, &root)?
+        };
+        w.assets_folder = Some(folder.to_string_lossy().into());
+        w.media
+            .retain(|m| m.role == "generated" || Path::new(&m.path).starts_with(&folder));
         w.revision += 1;
         w.updated = now();
-        s.save(&w)?;
+        studio.save(&w)?;
         grant(&app, &w)?;
         Ok(w)
     })
@@ -328,7 +345,7 @@ async fn save_settings(
     provider_keys: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<Settings, String> {
     work(move || {
-        if !["local", "api"].contains(&settings.mode.as_str())
+        if !["local", "api", "mimo"].contains(&settings.mode.as_str())
             || settings.model.trim().is_empty()
             || settings.model.len() > 200
         {
@@ -378,8 +395,10 @@ async fn provider_status() -> Result<std::collections::BTreeMap<String, bool>, S
     work(credentials::status).await
 }
 #[tauri::command]
-async fn unlock_provider_keys() -> Result<std::collections::BTreeMap<String, bool>, String> {
-    work(credentials::retry).await
+async fn check_provider_keys(
+    image_provider: String,
+) -> Result<std::collections::BTreeMap<String, bool>, String> {
+    work(move || credentials::retry(&image_provider)).await
 }
 #[tauri::command]
 async fn import_provider_keys() -> Result<std::collections::BTreeMap<String, bool>, String> {
@@ -397,38 +416,26 @@ async fn generate_asset(
             || prompt.trim().is_empty()
             || prompt.chars().count() > 8000
         {
-            return Err("Choose voice or image and enter 1–8,000 characters".into());
+            return Err("Choose an image or voice and enter 1–8,000 characters".into());
         }
         let studio = app.state::<Studio>();
         let _guard = studio.gate.lock().unwrap();
         studio.idle(&id)?;
         let mut w = studio.load(&id)?;
-        let settings = studio.data()?.settings.generation;
-        generation::validate(&settings)?;
-        if kind == "voice" && settings.voice.trim().is_empty() {
-            return Err(
-                "Configure your voice ID in Connections before generating narration".into(),
-            );
-        }
-        let secret = generation::secret(&settings, &kind)?;
+        let settings = studio.data()?.settings;
+        generation::validate(&settings.generation)?;
         let run = Run {
             id: model::id(),
             stage: kind,
             status: "running".into(),
             started: now(),
             finished: None,
-            message: "Generating media".into(),
+            message: "Generating asset".into(),
             logs: vec![],
             artifact_id: None,
             input_revision: w.revision,
+            base_artifact_id: None,
         };
-        store::write(
-            &PathBuf::from(&w.root)
-                .join(".framecraft/runs")
-                .join(&run.id)
-                .join("generation.json"),
-            &serde_json::json!({"kind":run.stage,"prompt":prompt.trim(),"settings":settings}),
-        )?;
         w.runs.push(run.clone());
         w.updated = now();
         studio.save(&w)?;
@@ -441,8 +448,61 @@ async fn generate_asset(
             settings,
             job,
             prompt.trim().into(),
-            secret,
         );
+        Ok(w)
+    })
+    .await
+}
+#[tauri::command]
+async fn import_assets(
+    app: tauri::AppHandle,
+    id: String,
+    paths: Vec<String>,
+) -> Result<Workspace, String> {
+    work(move || {
+        let studio = app.state::<Studio>();
+        let _guard = studio.gate.lock().unwrap();
+        studio.idle(&id)?;
+        let mut w = studio.load(&id)?;
+        if paths.len() + w.media.len() > 100 {
+            return Err("Use up to 100 assets per workspace".into());
+        }
+        let items = paths
+            .iter()
+            .map(|path| media::inventory(Path::new(path), "imported"))
+            .collect::<Result<Vec<_>, _>>()?;
+        for item in items {
+            if !w.media.iter().any(|m| m.path == item.path) {
+                w.media.push(item);
+            }
+        }
+        w.revision += 1;
+        w.updated = now();
+        studio.save(&w)?;
+        grant(&app, &w)?;
+        Ok(w)
+    })
+    .await
+}
+#[tauri::command]
+async fn remove_input(
+    app: tauri::AppHandle,
+    id: String,
+    media_id: String,
+) -> Result<Workspace, String> {
+    work(move || {
+        let studio = app.state::<Studio>();
+        let _guard = studio.gate.lock().unwrap();
+        studio.idle(&id)?;
+        let mut w = studio.load(&id)?;
+        if w.reference.as_ref().is_some_and(|m| m.id == media_id) {
+            w.reference = None;
+        } else {
+            w.media.retain(|m| m.id != media_id);
+        }
+        w.revision += 1;
+        w.updated = now();
+        studio.save(&w)?;
         Ok(w)
     })
     .await
@@ -471,63 +531,76 @@ async fn diagnostics(app: tauri::AppHandle) -> Result<Diagnostics, String> {
 async fn start_run(
     app: tauri::AppHandle,
     id: String,
-    stage: String,
-    artifact_id: Option<String>,
+    message: Option<String>,
+    base_artifact_id: Option<String>,
 ) -> Result<Workspace, String> {
     work(move || {
-        let s = app.state::<Studio>();
-        let _g = s.gate.lock().unwrap();
-        s.idle(&id)?;
-        let mut w = s.load(&id)?;
-        let settings = s.data()?.settings;
-        let mut plan = None;
-        match stage.as_str() {
-            "analyze" => {
-                if w.reference.is_none() { return Err("Choose a reference video first".into()); }
-            }
-            "adapt" | "plan" => {
-                pipeline::analysis(&w)?;
-                if w.brief.topic.trim().is_empty() { return Err("Enter your topic first".into()); }
-                if stage == "plan" && w.media.iter().all(|m| m.kind != "video") {
-                    return Err("Choose a raw-material folder containing videos".into());
-                }
-            }
-            "render" => {
-                let a = w.artifacts.iter().find(|a| Some(&a.id) == artifact_id.as_ref() && a.kind == "plan")
-                    .ok_or("Select an edit plan to render")?;
-                if a.data["_inputRevision"].as_u64() != Some(w.revision) {
-                    return Err("Inputs changed since this plan was made. Generate a new plan before rendering.".into());
-                }
-                let p: EditPlan = serde_json::from_value(a.data.clone()).map_err(|e| e.to_string())?;
-                media::validate_plan(&p, &w)?;
-                plan = Some(a.clone());
-            }
-            _ => return Err("Unknown stage".into()),
+        let studio = app.state::<Studio>();
+        let _guard = studio.gate.lock().unwrap();
+        studio.idle(&id)?;
+        let mut w = studio.load(&id)?;
+        let settings = studio.data()?.settings;
+        let is_chat = message.is_some();
+        let request = message.unwrap_or_else(|| w.brief.topic.clone());
+        if request.trim().is_empty() || request.chars().count() > 8000 {
+            return Err("Enter a message of 1–8,000 characters".into());
         }
-        if stage != "render" {
-            tools::required("claude", &settings.claude_path)?;
-            if settings.mode == "local" { tools::require_local_login(&settings.claude_path)?; }
-            if settings.mode == "api" && tools::key()?.is_none() {
-                return Err("Save your provider key in Settings first".into());
-            }
+        if !is_chat {
+            media::folder_path(Path::new(
+                w.assets_folder
+                    .as_deref()
+                    .ok_or("Choose your assets folder first")?,
+            ))?;
         }
-        if stage != "adapt" {
-            tools::required("ffmpeg", &settings.ffmpeg_path)?;
-            tools::required("ffprobe", &settings.ffprobe_path)?;
+        if !is_chat && w.brief.topic.trim().is_empty() && w.brief.direction.trim().is_empty() {
+            return Err("Describe the video you want to create".into());
+        }
+        if base_artifact_id.as_ref().is_some_and(|id| {
+            !w.artifacts
+                .iter()
+                .any(|a| &a.id == id && a.kind == "export")
+        }) {
+            return Err("The selected video version is unavailable".into());
+        }
+        tools::required("claude", &settings.claude_path)?;
+        tools::required("ffmpeg", &settings.ffmpeg_path)?;
+        tools::required("ffprobe", &settings.ffprobe_path)?;
+        if settings.mode == "mimo" {
+            credentials::key("MIMO_API_KEY")?;
+        } else if settings.mode == "local" {
+            tools::require_local_login(&settings.claude_path)?;
+        } else {
+            tools::key()?.ok_or("Save your third-party API key first")?;
         }
         let run = Run {
-            id: model::id(), stage, status: "running".into(), started: now(),
-            finished: None, message: "Starting".into(), logs: vec![],
-            artifact_id: None, input_revision: w.revision,
+            id: model::id(),
+            stage: if is_chat { "chat" } else { "create" }.into(),
+            status: "running".into(),
+            started: now(),
+            finished: None,
+            message: "Starting Claude Code".into(),
+            logs: vec![],
+            artifact_id: None,
+            input_revision: w.revision,
+            base_artifact_id,
         };
+        w.conversation.push(ChatMessage {
+            id: model::id(),
+            role: "user".into(),
+            text: request.trim().into(),
+            run_id: run.id.clone(),
+            created: now(),
+            artifact_id: None,
+        });
         w.runs.push(run.clone());
         w.updated = now();
-        s.save(&w)?;
+        studio.save(&w)?;
         let job = Arc::new(tools::Job::default());
-        s.jobs.lock().unwrap().insert(id, job.clone());
-        pipeline::launch(app.clone(), w.clone(), run, settings, job, plan);
+        studio.jobs.lock().unwrap().insert(id, job.clone());
+        pipeline::launch(app.clone(), w.clone(), run, settings, job);
         Ok(w)
-    }).await
+    })
+    .await
 }
 #[tauri::command]
 fn cancel_run(app: tauri::AppHandle, id: String) -> Result<(), String> {
@@ -537,50 +610,6 @@ fn cancel_run(app: tauri::AppHandle, id: String) -> Result<(), String> {
         job.cancel();
     }
     Ok(())
-}
-#[tauri::command]
-async fn save_plan(
-    app: tauri::AppHandle,
-    id: String,
-    artifact_id: String,
-    plan: EditPlan,
-) -> Result<Workspace, String> {
-    work(move || {
-        let s = app.state::<Studio>();
-        let _g = s.gate.lock().unwrap();
-        s.idle(&id)?;
-        let mut w = s.load(&id)?;
-        media::validate_plan(&plan, &w)?;
-        let old = w
-            .artifacts
-            .iter()
-            .find(|a| a.id == artifact_id && a.kind == "plan")
-            .ok_or("Edit plan not found")?;
-        if old.data["_inputRevision"].as_u64() != Some(w.revision) {
-            return Err("This plan is stale. Generate a new plan first.".into());
-        }
-        let a_id = model::id();
-        let mut data = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
-        data["_inputRevision"] = serde_json::json!(w.revision);
-        data["_referenceId"] = serde_json::json!(w.reference.as_ref().map(|r| &r.id));
-        let path = PathBuf::from(&w.root)
-            .join("edits")
-            .join(format!("{a_id}.json"));
-        write(&path, &data)?;
-        w.artifacts.push(Artifact {
-            id: a_id,
-            kind: "plan".into(),
-            title: format!("{} · revised", plan.title),
-            path: path.to_string_lossy().into(),
-            created: now(),
-            run_id: old.run_id.clone(),
-            data,
-        });
-        w.updated = now();
-        s.save(&w)?;
-        Ok(w)
-    })
-    .await
 }
 #[tauri::command]
 async fn reveal_path(app: tauri::AppHandle, id: String, path: String) -> Result<(), String> {
@@ -598,7 +627,10 @@ async fn reveal_path(app: tauri::AppHandle, id: String, path: String) -> Result<
             || w.reference
                 .as_ref()
                 .is_some_and(|m| Path::new(&m.path).canonicalize().ok().as_ref() == Some(&p))
-            || w.raw_folder.as_ref().is_some_and(|raw| {
+            || w.media
+                .iter()
+                .any(|m| Path::new(&m.path).canonicalize().ok().as_ref() == Some(&p))
+            || w.assets_folder.as_ref().is_some_and(|raw| {
                 Path::new(raw)
                     .canonicalize()
                     .ok()
@@ -631,6 +663,31 @@ async fn reveal_path(app: tauri::AppHandle, id: String, path: String) -> Result<
     .await
 }
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--mcp-stdio") {
+        let result = args
+            .get(2)
+            .zip(args.get(3))
+            .ok_or("Missing standalone storage or workspace")
+            .and_then(|(s, w)| bridge::stdio(s, w).map_err(|_| "Standalone MCP server failed"));
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--mcp-proxy") {
+        let result = args
+            .get(2)
+            .zip(args.get(3))
+            .ok_or("Missing MCP bridge address or workspace")
+            .and_then(|(a, w)| bridge::proxy(a, w).map_err(|_| "MCP bridge disconnected"));
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -641,6 +698,8 @@ fn main() {
                 gate: std::sync::Mutex::new(()),
                 jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
+            app.manage(terminal::Terminals::default());
+            app.manage(bridge::start(app.handle())?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -650,7 +709,7 @@ fn main() {
             get_workspace,
             save_brief,
             import_reference,
-            import_raw_folder,
+            set_assets_folder,
             attach_transcript,
             import_skill,
             save_settings,
@@ -658,18 +717,29 @@ fn main() {
             cli_status,
             adc_status,
             provider_status,
-            unlock_provider_keys,
+            check_provider_keys,
             import_provider_keys,
             generate_asset,
             start_run,
             cancel_run,
-            save_plan,
-            reveal_path
+            import_assets,
+            remove_input,
+            reveal_path,
+            terminal::terminal_open,
+            terminal::terminal_attach,
+            terminal::terminal_write,
+            terminal::terminal_resize,
+            terminal::terminal_close,
+            terminal::update_claude,
+            terminal::claude_installation,
+            terminal::install_claude,
+            bridge::terminal_context
         ])
         .build(tauri::generate_context!())
         .expect("Cannot start Framecraft")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                app.state::<terminal::Terminals>().stop_all();
                 let s = app.state::<Studio>();
                 for job in s.jobs.lock().unwrap().values() {
                     job.cancelled.store(true, Ordering::SeqCst);

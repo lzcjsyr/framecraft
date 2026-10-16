@@ -34,7 +34,16 @@ impl Studio {
     pub fn data(&self) -> Result<AppData, String> {
         let p = self.storage.join("settings.json");
         if p.exists() {
-            read(&p)
+            let mut data: AppData = read(&p)?;
+            // Migrate speech settings from the previous ByteDance-only release.
+            if data.settings.generation.voice_model.starts_with("seed-") {
+                data.settings.generation.voice_model = "mimo-v2.5-tts".into();
+                data.settings.generation.voice = "mimo_default".into();
+                data.settings.mode = "mimo".into();
+                data.settings.base_url = "https://api.xiaomimimo.com/anthropic".into();
+                data.settings.model = "mimo-v2.5".into();
+            }
+            Ok(data)
         } else {
             Ok(AppData::default())
         }
@@ -56,7 +65,16 @@ impl Studio {
     }
     pub fn load(&self, id: &str) -> Result<Workspace, String> {
         let root = self.root(id)?;
-        let w: Workspace = read(&root.join("workspace.json"))?;
+        let mut w: Workspace = read(&root.join("workspace.json"))?;
+        for builtin in builtins() {
+            if let Some(skill) = w
+                .skills
+                .iter_mut()
+                .find(|skill| skill.id == builtin.id && skill.origin == "Built-in")
+            {
+                *skill = builtin;
+            }
+        }
         if w.schema_version != 1 || w.id != id {
             return Err("Unsupported workspace manifest".into());
         }
@@ -148,10 +166,11 @@ pub fn create(name: String, folder: String) -> Result<Workspace, String> {
             platform: "Douyin / TikTok".into(),
             duration: 60,
             aspect: "9:16".into(),
+            narration: true,
             ..Default::default()
         },
         reference: None,
-        raw_folder: None,
+        assets_folder: None,
         media: vec![],
         skills: builtins(),
         selected_skills: vec![
@@ -161,6 +180,9 @@ pub fn create(name: String, folder: String) -> Result<Workspace, String> {
         ],
         artifacts: vec![],
         runs: vec![],
+        conversation: vec![],
+        agent_session: None,
+        terminal_session: None,
     };
     write(&root.join("workspace.json"), &w)?;
     Ok(w)
@@ -192,6 +214,7 @@ mod tests {
             logs: vec![],
             artifact_id: None,
             input_revision: 0,
+            base_artifact_id: None,
         });
         let w = studio.register(w, &root).unwrap();
         assert_eq!(w.runs[0].status, "interrupted");

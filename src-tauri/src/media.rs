@@ -8,7 +8,8 @@ pub fn kind(p: &Path) -> Option<&'static str> {
     let e = p.extension()?.to_str()?.to_lowercase();
     match e.as_str() {
         "mp4" | "mov" | "mkv" | "avi" | "webm" | "m4v" => Some("video"),
-        "wav" | "mp3" | "m4a" | "aac" | "flac" => Some("audio"),
+        "wav" | "mp3" | "m4a" | "aac" | "flac" | "ogg" => Some("audio"),
+        "txt" | "md" | "srt" | "vtt" | "json" | "csv" => Some("text"),
         "png" | "jpg" | "jpeg" | "webp" => Some("image"),
         _ => None,
     }
@@ -24,10 +25,14 @@ pub fn inventory(p: &Path, role: &str) -> Result<Media, String> {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let mut transcript = None;
+    let mut transcript = if k == "text" {
+        Some(small_text(&p)?)
+    } else {
+        None
+    };
     for ext in ["srt", "vtt", "txt"] {
         let sidecar = p.with_extension(ext);
-        if sidecar.is_file() {
+        if k != "text" && sidecar.is_file() {
             transcript = Some(small_text(&sidecar)?);
             break;
         }
@@ -49,43 +54,125 @@ pub fn inventory(p: &Path, role: &str) -> Result<Media, String> {
         warning: None,
     })
 }
+pub fn folder_path(path: &Path) -> Result<PathBuf, String> {
+    let folder = path
+        .canonicalize()
+        .map_err(|_| "The assets folder is unavailable. Choose its current location.")?;
+    if !folder.is_dir() {
+        return Err("Choose an assets folder".into());
+    }
+    Ok(folder)
+}
+#[cfg(test)]
 pub fn scan(folder: &Path) -> Result<Vec<Media>, String> {
-    fn walk(p: &Path, files: &mut Vec<PathBuf>, depth: usize) -> Result<(), String> {
+    scan_excluding(folder, &[])
+}
+fn scan_excluding(folder: &Path, excluded: &[PathBuf]) -> Result<Vec<Media>, String> {
+    fn walk(
+        p: &Path,
+        files: &mut Vec<PathBuf>,
+        excluded: &[PathBuf],
+        depth: usize,
+    ) -> Result<(), String> {
         if depth > 12 {
             return Err("Folder nesting exceeds 12 levels".into());
         }
-        for e in fs::read_dir(p).map_err(|e| e.to_string())? {
-            let e = e.map_err(|e| e.to_string())?;
-            let ty = e.file_type().map_err(|e| e.to_string())?;
-            let name = e.file_name().to_string_lossy().to_string();
+        for entry in fs::read_dir(p).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let ty = entry.file_type().map_err(|e| e.to_string())?;
+            let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.')
-                || [
-                    "exports",
-                    "assets",
-                    "analysis",
-                    "scripts",
-                    "edits",
-                    "node_modules",
-                ]
-                .contains(&name.as_str())
+                || is_export_name(&name)
+                || ["node_modules", "target"].contains(&name.as_str())
+                || excluded.contains(&entry.path())
             {
                 continue;
             }
             if ty.is_dir() {
-                walk(&e.path(), files, depth + 1)?
-            } else if ty.is_file() && kind(&e.path()).is_some() {
-                files.push(e.path());
+                walk(&entry.path(), files, excluded, depth + 1)?;
+            } else if ty.is_file() && kind(&entry.path()).is_some() {
+                files.push(entry.path());
                 if files.len() > 500 {
-                    return Err("This folder has more than 500 media files. Choose a smaller raw-material folder.".into());
+                    return Err("The assets folder contains more than 500 supported files. Choose a smaller folder.".into());
                 }
             }
         }
         Ok(())
     }
     let mut files = vec![];
-    walk(folder, &mut files, 0)?;
+    walk(folder, &mut files, excluded, 0)?;
     files.sort();
-    files.iter().map(|p| inventory(p, "raw")).collect()
+    files.iter().map(|path| inventory(path, "folder")).collect()
+}
+// Recognizable across workspaces, including interrupted renders not yet registered.
+fn is_export_name(name: &str) -> bool {
+    name.strip_prefix("framecraft-")
+        .and_then(|s| s.get(..36))
+        .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+}
+pub fn output_path(w: &Workspace, run_id: &str) -> PathBuf {
+    match &w.assets_folder {
+        Some(folder) => Path::new(folder).join(format!("framecraft-{run_id}.mp4")),
+        None => Path::new(&w.root)
+            .join("exports")
+            .join(run_id)
+            .join("video.mp4"),
+    }
+}
+pub fn refresh_assets(w: &mut Workspace) -> Result<(), String> {
+    let folder = folder_path(Path::new(
+        w.assets_folder
+            .as_deref()
+            .ok_or("Choose your assets folder first")?,
+    ))?;
+    let root = PathBuf::from(&w.root);
+    let mut excluded = if root == folder {
+        ["exports", "analysis", "edits", "scripts"]
+            .map(|name| root.join(name))
+            .to_vec()
+    } else if root.starts_with(&folder) {
+        vec![root.clone()]
+    } else {
+        vec![]
+    };
+    if root == folder {
+        excluded.push(root.join("workspace.json"));
+    }
+    excluded.extend(
+        w.artifacts
+            .iter()
+            .filter(|a| ["image", "voice"].contains(&a.kind.as_str()))
+            .map(|a| PathBuf::from(&a.path)),
+    );
+    excluded.extend(
+        w.media
+            .iter()
+            .filter(|m| m.role == "generated")
+            .map(|m| PathBuf::from(&m.path)),
+    );
+    let mut items = scan_excluding(&folder, &excluded)?;
+    for item in &mut items {
+        if let Some(old) = w.media.iter().find(|old| {
+            old.path == item.path && old.bytes == item.bytes && old.modified == item.modified
+        }) {
+            let transcript = item.transcript.take();
+            *item = old.clone();
+            item.role = "folder".into();
+            if transcript.is_some() {
+                item.transcript = transcript;
+                item.warning = None;
+            }
+        }
+    }
+    items.extend(
+        w.media
+            .iter()
+            .filter(|m| m.role == "generated" && verify_source(m).is_ok())
+            .cloned(),
+    );
+    w.assets_folder = Some(folder.to_string_lossy().into());
+    w.media = items;
+    Ok(())
 }
 pub fn verify_source(m: &Media) -> Result<(), String> {
     let meta = fs::metadata(&m.path).map_err(|_| format!("Source is missing: {}", m.name))?;
@@ -96,7 +183,7 @@ pub fn verify_source(m: &Media) -> Result<(), String> {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     if meta.len() != m.bytes || modified != m.modified {
-        return Err(format!("{} changed on disk. Re-import the reference or refresh the raw folder before continuing.",m.name));
+        return Err(format!("{} changed on disk. Re-add the reference or run Create video again to rescan the assets folder.",m.name));
     }
     Ok(())
 }
@@ -109,6 +196,9 @@ pub fn prepare(
 ) -> Result<(), String> {
     job.check()?;
     verify_source(m)?;
+    if m.kind == "text" {
+        return Ok(());
+    }
     if m.kind == "image" {
         m.frames = vec![Frame {
             time: 0.,
@@ -185,44 +275,63 @@ pub fn prepare(
         }
     }
     if m.has_audio && m.transcript.is_none() {
-        if let Some(whisper) = resolve("whisper", &s.whisper_path) {
-            log(format!("Transcribing {} with local Whisper", m.name));
-            let wav = cache.join("speech.wav");
-            let mut c = command(&ffmpeg);
-            c.args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                &m.path,
-                "-vn",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-            ]);
-            c.arg(&wav);
-            let (ok, _, err) = execute(c, job, 120, |_| {})?;
-            if !ok {
-                return Err(err);
+        log(format!("Transcribing {} with MiMo ASR", m.name));
+        let transcript = (|| -> Result<String, String> {
+            if m.duration > 1800. {
+                return Err(
+                    "Audio exceeds 30 minutes; attach a transcript or trim the source.".into(),
+                );
             }
-            let mut c = command(&whisper);
-            c.arg(&wav)
-                .args(["--model", "base", "--output_format", "srt", "--output_dir"])
-                .arg(&cache)
-                .args(["--fp16", "False"]);
-            let (ok, _, err) = execute(c, job, 1800, |_| {})?;
-            if ok {
-                m.transcript = Some(small_text(&cache.join("speech.srt"))?)
-            } else {
-                m.warning = Some(format!(
-                    "Local transcription failed: {}",
-                    err.chars().take(200).collect::<String>()
+            let mut parts = Vec::new();
+            for offset in (0..m.duration.ceil() as usize).step_by(60) {
+                job.check()?;
+                let audio = cache.join("asr-segment.mp3");
+                let mut cmd = command(&ffmpeg);
+                cmd.args([
+                    "-v",
+                    "error",
+                    "-y",
+                    "-ss",
+                    &offset.to_string(),
+                    "-i",
+                    &m.path,
+                    "-t",
+                    "60",
+                    "-vn",
+                    "-ar",
+                    "24000",
+                    "-ac",
+                    "1",
+                    "-b:a",
+                    "64k",
+                ])
+                .arg(&audio);
+                let (ok, _, err) = execute(cmd, job, 120, |_| {})?;
+                if !ok {
+                    return Err(format!("Cannot extract speech: {err}"));
+                }
+                let bytes = fs::read(&audio).map_err(|e| e.to_string())?;
+                let text = tauri::async_runtime::block_on(crate::mimo::transcribe(&bytes, job))?;
+                parts.push(format!(
+                    "[Segment {}–{} seconds; word timing unavailable]\n{text}",
+                    offset,
+                    (offset + 60).min(m.duration.ceil() as usize)
                 ));
+                let _ = fs::remove_file(audio);
             }
-        } else {
-            m.warning=Some("No transcript: speech and audio content cannot be verified. Attach SRT/TXT or configure local Whisper.".into());
+            Ok(parts.join("\n\n"))
+        })();
+        match transcript {
+            Ok(text) => {
+                fs::write(cache.join("transcript.txt"), &text).map_err(|e| e.to_string())?;
+                m.transcript = Some(text);
+                m.warning = None;
+            }
+            Err(error) => {
+                job.check()?;
+                log(format!("ASR unavailable: {error}"));
+                m.warning = Some(format!("Speech unverified: {error}"));
+            }
         }
     }
     log(format!(
@@ -247,12 +356,15 @@ pub fn validate_plan(plan: &EditPlan, w: &Workspace) -> Result<f64, String> {
         let m = w
             .media
             .iter()
-            .find(|m| m.id == c.source_id && m.kind == "video")
-            .ok_or_else(|| format!("Clip {} references an unknown video", i + 1))?;
+            .find(|m| m.id == c.source_id && ["video", "image"].contains(&m.kind.as_str()))
+            .ok_or_else(|| format!("Clip {} references an unknown visual asset", i + 1))?;
         if !c.start.is_finite()
             || !c.end.is_finite()
             || c.start < 0.
-            || c.end > m.duration + 0.025
+            || (m.kind == "video" && c.end > m.duration + 0.025)
+            || (m.kind == "image" && (c.start != 0. || c.end > 600.))
+            || !c.audio_start.is_finite()
+            || c.audio_start < 0.
             || c.end - c.start < 0.15
         {
             return Err(format!(
@@ -263,6 +375,16 @@ pub fn validate_plan(plan: &EditPlan, w: &Workspace) -> Result<f64, String> {
         }
         if c.caption.chars().count() > 300 {
             return Err("A clip caption exceeds 300 characters".into());
+        }
+        if let Some(audio_id) = &c.audio_source_id {
+            let audio = w
+                .media
+                .iter()
+                .find(|m| &m.id == audio_id && m.kind == "audio")
+                .ok_or("Unknown soundtrack asset")?;
+            if c.audio_start >= audio.duration {
+                return Err("Soundtrack starts outside its source".into());
+            }
         }
         duration += c.end - c.start;
     }
@@ -412,23 +534,53 @@ pub fn render(
                     "vt",
                 ]);
             }
-            cmd.args(["-hwaccel", "videotoolbox"]);
+            if m.kind == "video" {
+                cmd.args(["-hwaccel", "videotoolbox"]);
+            }
         }
-        cmd.args(["-ss", &c.start.to_string(), "-i", &m.path]);
-        if !m.has_audio {
+        if m.kind == "image" {
+            cmd.args(["-loop", "1", "-framerate", "30"]);
+        } else {
+            cmd.args(["-ss", &c.start.to_string()]);
+        }
+        cmd.args(["-i", &m.path]);
+        let audio = c
+            .audio_source_id
+            .as_ref()
+            .and_then(|id| w.media.iter().find(|m| &m.id == id));
+        if let Some(audio) = audio {
+            verify_source(audio)?;
+            cmd.args(["-ss", &c.audio_start.to_string(), "-i", &audio.path]);
+        } else if !m.has_audio {
             cmd.args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]);
         }
+        let stretch = audio
+            .filter(|m| c.fit_audio && m.duration > seconds + 0.05)
+            .map(|m| m.duration / seconds);
+        if stretch.is_some_and(|factor| factor > 2.) {
+            return Err("Narration is too long for its source video. Shorten the narration or use a still image.".into());
+        }
+        let audio_filter = format!(
+            "{}aresample=48000,apad,atrim=duration={seconds}",
+            stretch
+                .map(|factor| format!("atempo={factor},"))
+                .unwrap_or_default()
+        );
         cmd.args([
             "-t",
             &seconds.to_string(),
             "-map",
             "0:v:0",
             "-map",
-            if m.has_audio { "0:a:0" } else { "1:a:0" },
+            if audio.is_none() && m.has_audio {
+                "0:a:0"
+            } else {
+                "1:a:0"
+            },
             "-vf",
             &vf,
             "-af",
-            &format!("aresample=48000,apad,atrim=duration={seconds}"),
+            &audio_filter,
         ]);
         cmd.args(encode_args());
         cmd.args([
@@ -463,8 +615,8 @@ pub fn render(
     }
     let concat = work.join("concat.txt");
     fs::write(&concat, list).map_err(|e| e.to_string())?;
-    let output = dir.join("video.mp4");
-    let partial = dir.join("video.partial.mp4");
+    let output = output_path(w, run_id);
+    let partial = output.with_extension("partial.mp4");
     let mut cmd = command(&ffmpeg);
     cmd.args([
         "-hide_banner",
@@ -487,7 +639,7 @@ pub fn render(
     }
     job.check()?;
     fs::rename(partial, &output).map_err(|e| e.to_string())?;
-    let sub = dir.join("captions.srt");
+    let sub = output.with_extension("srt");
     fs::write(&sub, captions(plan)).map_err(|e| e.to_string())?;
     crate::store::write(&dir.join("edit-plan.json"), plan)?;
     Ok(
@@ -511,6 +663,9 @@ mod tests {
                     beat: "".into(),
                     reason: "".into(),
                     caption: "Hi".into(),
+                    audio_source_id: None,
+                    audio_start: 0.,
+                    fit_audio: false,
                 },
                 Clip {
                     source_id: "x".into(),
@@ -519,6 +674,9 @@ mod tests {
                     beat: "".into(),
                     reason: "".into(),
                     caption: "Next".into(),
+                    audio_source_id: None,
+                    audio_start: 0.,
+                    fit_audio: false,
                 },
             ],
         };
@@ -576,7 +734,11 @@ mod integration {
         let mut w = store::create("Test workspace".into(), root.to_string_lossy().into()).unwrap();
         w.brief.aspect = "16:9".into();
         w.reference = Some(inventory(&root.join("reference.mp4"), "reference").unwrap());
-        w.media = scan(&root.join("raw")).unwrap();
+        w.media = scan(&root.join("raw"))
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.kind == "video")
+            .collect();
         let s = Settings::default();
         let job = Job::default();
         prepare(w.reference.as_mut().unwrap(), &root, &s, &job, |_| {}).unwrap();
@@ -601,6 +763,9 @@ mod integration {
                     beat: "Hook".into(),
                     reason: "Test".into(),
                     caption: "First caption".into(),
+                    audio_source_id: None,
+                    audio_start: 0.,
+                    fit_audio: false,
                 },
                 Clip {
                     source_id: w.media[1].id.clone(),
@@ -609,6 +774,9 @@ mod integration {
                     beat: "Finish".into(),
                     reason: "Test".into(),
                     caption: "Second caption".into(),
+                    audio_source_id: None,
+                    audio_start: 0.,
+                    fit_audio: false,
                 },
             ],
         };
@@ -656,6 +824,189 @@ mod integration {
         use std::io::Write;
         writeln!(&file, "changed").unwrap();
         assert!(verify_source(&w.media[0]).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod mixed_integration {
+    use super::*;
+    #[test]
+    #[ignore = "Real FFmpeg test: still image, separate soundtrack, and text input"]
+    fn real_mixed_assets() {
+        let root = std::env::temp_dir().join(format!("framecraft-mixed-{}", id()));
+        fs::create_dir_all(&root).unwrap();
+        let ffmpeg = required("ffmpeg", "").unwrap();
+        let job = Job::default();
+        let settings = Settings::default();
+        let mut image = command(&ffmpeg);
+        image
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x180",
+                "-frames:v",
+                "1",
+            ])
+            .arg(root.join("image.png"));
+        assert!(execute(image, &job, 30, |_| {}).unwrap().0);
+        let mut audio = command(&ffmpeg);
+        audio
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=3",
+            ])
+            .arg(root.join("tone.wav"));
+        assert!(execute(audio, &job, 30, |_| {}).unwrap().0);
+        fs::write(
+            root.join("notes.md"),
+            "Use a blue frame and the supplied tone.",
+        )
+        .unwrap();
+        let mut w =
+            crate::store::create("Mixed assets".into(), root.to_string_lossy().into()).unwrap();
+        w.assets_folder = Some(root.to_string_lossy().into());
+        w.brief.aspect = "16:9".into();
+        w.media = vec![
+            inventory(&root.join("image.png"), "imported").unwrap(),
+            inventory(&root.join("tone.wav"), "imported").unwrap(),
+            inventory(&root.join("notes.md"), "imported").unwrap(),
+        ];
+        w.media[1].transcript = Some("Synthetic sine wave, no speech.".into());
+        // A previously generated voice can be reused as a continuous soundtrack.
+        w.media[1].role = "generated".into();
+        for asset in &mut w.media {
+            prepare(asset, &root, &settings, &job, |_| {}).unwrap();
+        }
+        assert_eq!(
+            w.media[2].transcript.as_deref(),
+            Some("Use a blue frame and the supplied tone.")
+        );
+        let mut plan = EditPlan {
+            title: "Mixed assets".into(),
+            summary: "".into(),
+            warnings: vec![],
+            clips: vec![Clip {
+                source_id: w.media[0].id.clone(),
+                start: 0.,
+                end: 1.137,
+                beat: "".into(),
+                reason: "".into(),
+                caption: "A blue frame".into(),
+                audio_source_id: Some(w.media[1].id.clone()),
+                audio_start: 0.4,
+                fit_audio: false,
+            }],
+        };
+        let run_id = id();
+        let data = render(&w, &plan, &run_id, &settings, &job, |line| {
+            println!("{line}")
+        })
+        .unwrap();
+        let mut output =
+            inventory(Path::new(data["video"].as_str().unwrap()), "generated").unwrap();
+        output.transcript = Some("Tone, no speech".into());
+        prepare(&mut output, &root, &settings, &job, |_| {}).unwrap();
+        assert!(output.has_audio);
+        assert!((output.duration - 1.133333).abs() < 0.07);
+        assert_eq!(
+            Path::new(data["video"].as_str().unwrap()).parent(),
+            Some(root.as_path())
+        );
+        assert_eq!(
+            Path::new(data["captions"].as_str().unwrap()).parent(),
+            Some(root.as_path())
+        );
+        refresh_assets(&mut w).unwrap();
+        assert_eq!(
+            w.media.len(),
+            3,
+            "A finished video must not become an input asset"
+        );
+        let second = render(&w, &plan, &id(), &settings, &job, |_| {}).unwrap();
+        assert_ne!(data["video"], second["video"]);
+        assert!(Path::new(data["video"].as_str().unwrap()).exists());
+        plan.clips[0].audio_start = 99.;
+        assert!(validate_plan(&plan, &w).is_err());
+        plan.clips[0].audio_start = 0.;
+        plan.clips[0].source_id = w.media[2].id.clone();
+        assert!(validate_plan(&plan, &w).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+    #[test]
+    fn folder_is_rescanned_recursively_and_tracks_additions_changes_and_removals() {
+        let root = std::env::temp_dir().join(format!("framecraft-folder-{}", id()));
+        let input = root.join("input");
+        fs::create_dir_all(input.join("assets")).unwrap();
+        fs::write(input.join("goal.md"), "Use all related files.").unwrap();
+        fs::write(input.join("assets/details.txt"), "Original details.").unwrap();
+        fs::write(input.join(".env"), "PRIVATE=not-an-asset").unwrap();
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let mut w = crate::store::create("Folder".into(), work.to_string_lossy().into()).unwrap();
+        w.assets_folder = Some(input.to_string_lossy().into());
+        refresh_assets(&mut w).unwrap();
+        assert_eq!(w.media.len(), 2);
+        let old = w
+            .media
+            .iter()
+            .find(|m| m.name == "goal.md")
+            .unwrap()
+            .id
+            .clone();
+        let generated = work.join("generated.jpg");
+        fs::write(&generated, "Generated fixture").unwrap();
+        let generated = inventory(&generated, "generated").unwrap();
+        let generated_id = generated.id.clone();
+        w.media.push(generated);
+        fs::write(
+            input.join("assets/details.txt"),
+            "Updated and longer details.",
+        )
+        .unwrap();
+        fs::write(
+            input.join("new.md"),
+            "A new file added after folder selection.",
+        )
+        .unwrap();
+        refresh_assets(&mut w).unwrap();
+        assert_eq!(w.media.len(), 4);
+        assert!(w
+            .media
+            .iter()
+            .any(|m| m.id == generated_id && m.role == "generated"));
+        assert_eq!(
+            w.media.iter().find(|m| m.name == "goal.md").unwrap().id,
+            old
+        );
+        assert_eq!(
+            w.media
+                .iter()
+                .find(|m| m.name == "details.txt")
+                .unwrap()
+                .transcript
+                .as_deref(),
+            Some("Updated and longer details.")
+        );
+        fs::remove_file(input.join("goal.md")).unwrap();
+        refresh_assets(&mut w).unwrap();
+        assert_eq!(w.media.len(), 3);
+        assert!(!w.media.iter().any(|m| m.id == old));
+        assert!(folder_path(&input.join("new.md")).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,364 +1,267 @@
-import { useEffect, useState } from "react";
-import {
-  Check,
-  KeyRound,
-  LoaderCircle,
-  RefreshCw,
-  Save,
-  Terminal,
-  TriangleAlert,
-} from "lucide-react";
-import type { CliStatus, Diagnostics, Lang, Settings } from "./types";
-import { call, date } from "./api";
-import { t, type Key } from "./i18n";
-import {
-  ProviderFields,
-  providerNames,
-  type ProviderStatus,
-} from "./Generation";
-import { PageHeading } from "./Studio";
+import { useState } from "react";
+import { Check, LoaderCircle } from "lucide-react";
+import { call, describe, native } from "./api";
+import { Modal } from "./Modal";
+import type { AdcStatus, Diagnostics, Settings } from "./types";
 export function SettingsView({
-  lang,
   settings,
-  busy,
-  perform,
+  onClose,
   onSave,
 }: {
-  lang: Lang;
   settings: Settings;
-  busy: boolean;
-  perform: (fn: () => Promise<void>) => Promise<void>;
-  onSave: (s: Settings) => Promise<void>;
+  onClose: () => void;
+  onSave: (settings: Settings, keys: Record<string, string>) => Promise<void>;
 }) {
-  const tr = (k: Key) => t(lang, k);
-  const [draft, setDraft] = useState(settings);
-  const [key, setKey] = useState("");
-  const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
-  const [providerStatus, setProviderStatus] = useState<ProviderStatus>({});
-  const [credentialError, setCredentialError] = useState(false);
-  const [importNote, setImportNote] = useState("");
-  useEffect(() => {
-    let live = true;
-    call<ProviderStatus>("provider_status")
-      .then((v) => {
-        if (live) setProviderStatus(v);
-      })
-      .catch(() => {
-        if (live) setCredentialError(true);
-      });
-    return () => {
-      live = false;
-    };
-  }, []);
-  const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [verifying, setVerifying] = useState(false);
-  const [cli, setCli] = useState<CliStatus | null>(null);
-  useEffect(() => setCli(null), [draft.claudePath]);
-  useEffect(() => setDraft(settings), [settings]);
-  function update(k: keyof Settings, v: string) {
-    setDraft((old) => ({ ...old, [k]: v }));
-  }
-  const paths: [
-    "claudePath" | "ffmpegPath" | "ffprobePath" | "whisperPath",
-    Key,
-  ][] = [
-    ["claudePath", "claudePath"],
-    ["ffmpegPath", "ffmpegPath"],
-    ["ffprobePath", "ffprobePath"],
-    ["whisperPath", "whisperPath"],
-  ];
-  async function save() {
-    const saved = await call<Settings>("save_settings", {
-      settings: draft,
-      apiKey: key || null,
-      providerKeys,
-    });
-    setKey("");
-    setProviderKeys({});
-    setProviderStatus(await call<ProviderStatus>("provider_status"));
-    await onSave(saved);
+  const [draft, setDraft] = useState<Settings>({
+    ...settings,
+    generation: {
+      ...settings.generation,
+      imageProvider:
+        settings.generation.imageProvider === "google"
+          ? "google_adc"
+          : settings.generation.imageProvider,
+    },
+  });
+  const [keys, setKeys] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [status, setStatus] = useState<Record<string, boolean>>({});
+  const [tools, setTools] = useState<Diagnostics>();
+  const [adc, setAdc] = useState<AdcStatus>();
+  const [verified, setVerified] = useState(false);
+  const generation = draft.generation;
+  const update = (key: keyof typeof generation, value: string) =>
+    setDraft({ ...draft, generation: { ...generation, [key]: value } });
+  async function verify() {
+    setBusy(true);
+    setMessage("");
+    try {
+      const results = await Promise.allSettled([
+        call<Record<string, boolean>>("check_provider_keys", {
+          imageProvider: generation.imageProvider,
+        }),
+        call<Diagnostics>("diagnostics"),
+        call<AdcStatus>("adc_status", {
+          googleProject: generation.googleProject,
+        }),
+      ]);
+      const [providers, diagnostics, google] = results;
+      if (providers.status === "fulfilled") setStatus(providers.value);
+      if (diagnostics.status === "fulfilled") {
+        setTools(diagnostics.value);
+      }
+      if (google.status === "fulfilled") setAdc(google.value);
+      setVerified(true);
+      const errors = results
+        .filter((r) => r.status === "rejected")
+        .map((r) => describe((r as PromiseRejectedResult).reason));
+      if (errors.length) setMessage(errors.join("\n"));
+    } finally {
+      setBusy(false);
+    }
   }
   return (
-    <>
-      <PageHeading title={tr("agentTitle")} sub={tr("agentSub")} />
-      <div className="settings-form">
-        <div className="auth-modes">
-          {(["local", "api"] as const).map((mode) => (
-            <button
-              key={mode}
-              className={draft.mode === mode ? "active" : ""}
-              disabled={busy}
-              onClick={() => update("mode", mode)}
-            >
-              {mode === "local" ? (
-                <Terminal size={24} />
-              ) : (
-                <KeyRound size={24} />
-              )}
-              <span>
-                <strong>
-                  {tr(mode === "local" ? "localMode" : "apiMode")}
-                </strong>
-                <small>
-                  {tr(mode === "local" ? "localModeSub" : "apiModeSub")}
-                </small>
-              </span>
-              <span className="radio-indicator">
-                {draft.mode === mode ? <Check size={12} /> : null}
-              </span>
-            </button>
-          ))}
-        </div>
-        <div className="settings-fields">
-          {draft.mode === "api" ? (
-            <>
-              <label>
-                {tr("baseUrl")}
-                <input
-                  disabled={busy}
-                  type="url"
-                  value={draft.baseUrl}
-                  onChange={(e) => update("baseUrl", e.target.value)}
-                />
-              </label>
-              <label>
-                {tr("apiKey")}
-                <input
-                  aria-label={tr("apiKey")}
-                  disabled={busy}
-                  type="password"
-                  autoComplete="new-password"
-                  placeholder={tr("keyPlaceholder")}
-                  value={key}
-                  onChange={(e) => setKey(e.target.value)}
-                />
-                <small>{tr("keyNote")}</small>
-              </label>
-            </>
-          ) : (
-            <div className="cli-login">
-              <div className="cli-login-row">
-                <div
-                  className={`cli-login-status ${cli?.loggedIn ? "verified" : ""}`}
-                  role="status"
-                  aria-live="polite"
-                >
-                  {verifying ? (
-                    <LoaderCircle size={20} className="spin" />
-                  ) : cli?.loggedIn ? (
-                    <Check size={20} />
-                  ) : cli ? (
-                    <TriangleAlert size={20} />
-                  ) : (
-                    <Terminal size={20} />
-                  )}
-                  <div>
-                    <strong>
-                      {tr(
-                        verifying
-                          ? "checkingCli"
-                          : cli
-                            ? cli.loggedIn
-                              ? "signedIn"
-                              : "signedOut"
-                            : "cliNotChecked",
-                      )}
-                    </strong>
-                    {cli?.loggedIn && cli.account ? (
-                      <small>{cli.account}</small>
-                    ) : null}
-                  </div>
-                </div>
-                <button
-                  className="secondary"
-                  disabled={busy}
-                  onClick={() =>
-                    perform(async () => {
-                      setVerifying(true);
-                      setCli(null);
-                      try {
-                        setCli(
-                          await call<CliStatus>("cli_status", {
-                            claudePath: draft.claudePath,
-                          }),
-                        );
-                      } finally {
-                        setVerifying(false);
-                      }
-                    })
-                  }
-                >
-                  {verifying ? (
-                    <LoaderCircle size={15} className="spin" />
-                  ) : (
-                    <RefreshCw size={15} />
-                  )}
-                  {tr("verifyCli")}
-                </button>
-              </div>
-              <p className="cli-login-note">{tr("cliCheckNote")}</p>
-              {cli?.error ? (
-                <p className="cli-login-error" role="alert">
-                  {cli.error}
-                </p>
-              ) : null}
-              {cli ? (
-                <div className="cli-login-details">
-                  <span>{cli.version}</span>
-                  {cli.path ? <code>{cli.path}</code> : null}
-                  <small>
-                    {tr("checkedAt")} · {date(cli.checked, lang)}
-                  </small>
-                </div>
-              ) : null}
-            </div>
-          )}
-          <label>
-            {tr("model")}
-            <input
-              disabled={busy}
-              value={draft.model}
-              onChange={(e) => update("model", e.target.value)}
-              placeholder={
-                draft.mode === "local" ? "sonnet" : "Provider model ID"
-              }
-            />
-          </label>
-          {draft.mode === "api" ? (
-            <p className="settings-note">{tr("apiHelp")}</p>
-          ) : null}
-        </div>
-        <div className="section-title">
-          <span className="section-number">02</span>
-          <h2>{tr("tools")}</h2>
-        </div>
-        <p className="tool-note">{tr("toolNote")}</p>
-        <div className="tool-fields">
-          {paths.map(([key, label]) => (
-            <label key={key}>
-              {tr(label)}
+    <Modal title="Settings" busy={busy} onClose={onClose} wide>
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          setBusy(true);
+          setMessage("");
+          try {
+            await onSave(draft, keys);
+            onClose();
+          } catch (error) {
+            setMessage(describe(error));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <fieldset disabled={busy}>
+          <div className="settings-section">
+            <h3>Speech · MiMo</h3>
+            <p>
+              MiMo provides narration and transcription. Choose the agent's
+              connection in the Claude Code panel.
+            </p>
+            <label>
+              MiMo API key{" "}
               <input
-                disabled={busy}
-                value={draft[key]}
-                onChange={(e) => update(key, e.target.value)}
-                placeholder={tr("autodetect")}
+                type="password"
+                autoComplete="off"
+                placeholder={
+                  status.MIMO_API_KEY
+                    ? "Saved locally"
+                    : "Enter key to save, or leave blank to keep saved key"
+                }
+                value={keys.MIMO_API_KEY || ""}
+                onChange={(e) =>
+                  setKeys({ ...keys, MIMO_API_KEY: e.target.value })
+                }
               />
             </label>
-          ))}
-        </div>
-        {credentialError ? (
-          <div className="credential-error" role="alert">
-            <p>{tr("credentialError")}</p>
-            <button
-              className="secondary small"
-              disabled={busy}
-              onClick={() =>
-                perform(async () => {
-                  setProviderStatus(
-                    await call<ProviderStatus>("unlock_provider_keys"),
-                  );
-                  setCredentialError(false);
-                })
-              }
-            >
-              <KeyRound size={15} />
-              {tr("unlockProviderKeys")}
-            </button>
+            <div className="voice-field">
+              <label>
+                Narration voice
+                <select
+                  value={generation.voice}
+                  onChange={(e) => update("voice", e.target.value)}
+                >
+                  {[
+                    "mimo_default",
+                    "冰糖",
+                    "茉莉",
+                    "苏打",
+                    "白桦",
+                    "Mia",
+                    "Chloe",
+                    "Milo",
+                    "Dean",
+                  ].map((voice) => (
+                    <option key={voice}>{voice}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </div>
+          <div className="settings-section">
+            <h3>Image generation</h3>
+            <label>
+              Provider
+              <select
+                value={
+                  generation.imageProvider === "google"
+                    ? "google_adc"
+                    : generation.imageProvider
+                }
+                onChange={(e) =>
+                  setDraft({
+                    ...draft,
+                    generation: {
+                      ...generation,
+                      imageProvider: e.target.value,
+                      imageModel:
+                        e.target.value === "doubao"
+                          ? "doubao-seedream-5-0-pro-260628"
+                          : "gemini-3.1-flash-image",
+                    },
+                  })
+                }
+              >
+                <option value="google_adc">
+                  Google · Application Default Credentials
+                </option>
+                <option value="doubao">Seedream · Volcengine</option>
+              </select>
+            </label>
+            {generation.imageProvider === "doubao" ? (
+              <label>
+                Seedream API key
+                <input
+                  type="password"
+                  autoComplete="off"
+                  placeholder={
+                    status.VOLCENGINE_API_KEY
+                      ? "Saved locally"
+                      : "Leave blank to keep saved key"
+                  }
+                  value={keys.VOLCENGINE_API_KEY || ""}
+                  onChange={(e) =>
+                    setKeys({ ...keys, VOLCENGINE_API_KEY: e.target.value })
+                  }
+                />
+              </label>
+            ) : (
+              <>
+                <label>
+                  Google Cloud project
+                  <input
+                    value={generation.googleProject}
+                    placeholder="Use the project from your ADC login"
+                    onChange={(e) => update("googleProject", e.target.value)}
+                  />
+                </label>
+                <p className="help-text">
+                  Uses your local{" "}
+                  <code>gcloud auth application-default login</code>.
+                </p>
+              </>
+            )}
+            <label>
+              Image model
+              <input
+                required
+                value={generation.imageModel}
+                onChange={(e) => update("imageModel", e.target.value)}
+              />
+            </label>
+          </div>
+          <details className="advanced-settings">
+            <summary>Executable paths</summary>
+            <p>Leave blank to detect installed tools.</p>
+            {(
+              [
+                ["claudePath", "Claude Code"],
+                ["ffmpegPath", "FFmpeg"],
+                ["ffprobePath", "FFprobe"],
+              ] as const
+            ).map(([key, name]) => (
+              <label key={key}>
+                {name}
+                <input
+                  value={draft[key]}
+                  placeholder="Auto-detect"
+                  onChange={(e) =>
+                    setDraft({ ...draft, [key]: e.target.value })
+                  }
+                />
+              </label>
+            ))}
+          </details>
+        </fieldset>
+        {verified ? (
+          <div className="connection-results" aria-live="polite">
+            <p>
+              {status.MIMO_API_KEY ? <Check size={14} /> : null}MiMo key:{" "}
+              {status.MIMO_API_KEY ? "saved" : "missing"}
+            </p>
+            <p>Claude Code: {tools?.claude || "not found"}</p>
+            <p>
+              FFmpeg: {tools?.ffmpeg ? "installed" : "not found"} · FFprobe:{" "}
+              {tools?.ffprobe ? "installed" : "not found"}
+            </p>
+            <p>
+              Google ADC:{" "}
+              {adc?.loggedIn
+                ? `connected${adc.project ? ` · ${adc.project}` : ""}`
+                : adc?.error || "unavailable"}
+            </p>
+            <small>
+              Keys are checked for presence. Creating an asset tests provider
+              access.
+            </small>
           </div>
         ) : null}
-        <ProviderFields
-          lang={lang}
-          value={draft.generation}
-          update={(generation) => setDraft((old) => ({ ...old, generation }))}
-          keys={providerKeys}
-          setKeys={setProviderKeys}
-          status={providerStatus}
-          busy={busy}
-          importKeys={() =>
-            perform(async () => {
-              const status = await call<ProviderStatus>("import_provider_keys");
-              setProviderStatus(status);
-              setImportNote(
-                tr(
-                  providerNames.some((name) => status[name])
-                    ? "providerKeySaved"
-                    : "noProviderKeys",
-                ),
-              );
-            })
-          }
-        />
-        {importNote ? (
-          <p role="status" className="tool-note">
-            {importNote}
+        {message ? (
+          <p role="alert" className="form-error">
+            {message}
           </p>
         ) : null}
-        <div className="settings-actions">
+        <div className="modal-actions">
           <button
-            className="primary"
-            disabled={busy}
-            onClick={() => perform(save)}
+            type="button"
+            className="outline-button"
+            disabled={busy || !native}
+            onClick={verify}
           >
-            <Save size={17} />
-            {tr("save")}
+            {busy ? <LoaderCircle size={15} className="spin" /> : null}Check
+            connections
           </button>
-          <button
-            className="secondary"
-            disabled={busy}
-            onClick={() =>
-              perform(async () => {
-                setChecking(true);
-                try {
-                  await save();
-                  setDiagnostics(await call<Diagnostics>("diagnostics"));
-                } finally {
-                  setChecking(false);
-                }
-              })
-            }
-          >
-            {checking ? (
-              <LoaderCircle size={16} className="spin" />
-            ) : (
-              <RefreshCw size={16} />
-            )}{" "}
-            {tr("check")}
+          <button className="primary-button" disabled={busy || !native}>
+            Save settings
           </button>
         </div>
-        {diagnostics ? (
-          <div className="diagnostics">
-            {diagnostics.keySaved ? (
-              <p className="diagnostic-key">
-                <KeyRound size={13} />
-                {tr("keySaved")}
-              </p>
-            ) : null}
-            {(["claude", "ffmpeg", "ffprobe", "whisper"] as const).map(
-              (tool) => (
-                <div className="diagnostic-tool" key={tool}>
-                  <span
-                    className={diagnostics[tool] ? "ok-dot" : "missing-dot"}
-                  />
-                  <strong>
-                    {tool === "claude"
-                      ? "Claude Code"
-                      : tool === "whisper"
-                        ? "Whisper"
-                        : tool.toUpperCase()}
-                  </strong>
-                  <code>{diagnostics[tool] || tr("missing")}</code>
-                </div>
-              ),
-            )}
-            {diagnostics.errors.map((error, i) => (
-              <p className="diagnostic-error" key={i}>
-                {error}
-              </p>
-            ))}
-          </div>
-        ) : null}
-      </div>
-    </>
+      </form>
+    </Modal>
   );
 }

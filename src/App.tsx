@@ -1,951 +1,509 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
-  ArrowUpRight,
-  ArrowRight,
-  BookOpen,
-  Check,
+  ChevronDown,
   Clapperboard,
   FolderOpen,
-  Layers,
   LoaderCircle,
   Plus,
   Settings2,
-  SlidersHorizontal,
-  Sparkles,
-  TriangleAlert,
   X,
-  History,
-  PanelTop,
-  Globe,
-  Folder,
 } from "lucide-react";
-import type {
-  AppData,
-  Artifact,
-  Brief,
-  Lang,
-  Plan,
-  Settings,
-  Workspace,
-} from "./types";
-import { call, native, pick } from "./api";
-import { t, type Key } from "./i18n";
-import {
-  BriefView,
-  StudyView,
-  EditView,
-  SkillsView,
-  OutputsView,
-  RunsView,
-} from "./Studio";
+import { call, defaultBrief, defaultSettings, describe, native, pick } from "./api";
+import type { AppData, Brief, Settings, Workspace } from "./types";
+import { Guidance } from "./Guidance";
+import { Assets } from "./Assets";
+import { Result } from "./Result";
+import { TerminalPanel, type TerminalHandle } from "./Terminal";
 import { SettingsView } from "./Settings";
 import "./style.css";
-type Tab =
-  | "brief"
-  | "study"
-  | "edit"
-  | "skills"
-  | "outputs"
-  | "runs"
-  | "settings";
-const defaultSettings: Settings = {
-  mode: "local",
-  baseUrl: "https://api.anthropic.com",
-  model: "sonnet",
-  claudePath: "",
-  ffmpegPath: "",
-  ffprobePath: "",
-  whisperPath: "",
-  generation: {
-    voice: "",
-    voiceModel: "seed-tts-2.0-standard",
-    speechRate: 0,
-    emotion: "neutral",
-    imageProvider: "doubao",
-    imageModel: "doubao-seedream-5-0-pro-260628",
-    imageSize: "2048x2048",
-    googleProject: "",
-  },
-};
-const tabs: [Tab, typeof BookOpen][] = [
-  ["brief", SlidersHorizontal],
-  ["study", BookOpen],
-  ["edit", Clapperboard],
-  ["skills", Layers],
-  ["outputs", PanelTop],
-  ["runs", History],
-];
-export default function App() {
-  const [lang, setLang] = useState<Lang>(() =>
-    localStorage.getItem("framecraft.language") === "zh" ? "zh" : "en",
-  );
-  const tr = (key: Key) => t(lang, key);
-  const [data, setData] = useState<AppData>({
-    recents: [],
-    settings: defaultSettings,
-  });
-  const [w, setW] = useState<Workspace | null>(null);
-  const workspaceRef = useRef(w);
-  workspaceRef.current = w;
-  const [brief, setBrief] = useState<Brief | null>(null);
-  const [selected, setSelected] = useState<string[]>([]);
-  const [tab, setTab] = useState<Tab>("brief");
-  const [artifactId, setArtifactId] = useState<string>("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [modal, setModal] = useState(false);
-  const [workspaceMode, setWorkspaceMode] = useState<"create" | "open">(
-    "create",
-  );
-  const [modalError, setModalError] = useState("");
-  const workspaceTrigger = useRef<HTMLButtonElement>(null);
-  const workspaceDialog = useRef<HTMLFormElement>(null);
-  const busyRef = useRef(false);
-  busyRef.current = busy;
-  const [name, setName] = useState("");
-  const [folder, setFolder] = useState("");
-  const [logs, setLogs] = useState<Record<string, string[]>>({});
-  const activeRun = w?.runs.find((r) => r.status === "running");
-  const locked = busy || !!activeRun;
-  const dirty =
-    !!w &&
-    !!brief &&
-    (JSON.stringify(w.brief) !== JSON.stringify(brief) ||
-      JSON.stringify(w.selectedSkills) !== JSON.stringify(selected));
-  const assign = (next: Workspace) => {
-    setW(next);
-    setBrief(next.brief);
-    setSelected(next.selectedSkills);
-  };
-  async function refreshData() {
-    setData(await call<AppData>("app_data"));
+const draftKey = (id?: string) => `framecraft.draft.v2.${id || "new"}`;
+function restoredBrief(w?: Workspace): Brief {
+  try {
+    const draft = JSON.parse(localStorage.getItem(draftKey(w?.id)) || "null");
+    if (
+      draft?.revision === (w?.revision || 0) &&
+      typeof draft.brief?.topic === "string"
+    )
+      return { ...(w?.brief || defaultBrief), ...draft.brief };
+  } catch {
+    /* A corrupt local draft must not prevent opening the workspace. */
   }
-  async function perform(fn: () => Promise<void>) {
+  return w?.brief || defaultBrief;
+}
+export default function App() {
+  const [data, setData] = useState<AppData>({
+    settings: defaultSettings,
+    recents: [],
+  });
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [brief, setBrief] = useState<Brief>(() => restoredBrief());
+  const [busy, setBusy] = useState(native);
+  const [error, setError] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [connectionPending, setConnectionPending] = useState(false);
+  const [selectedOutput, setSelectedOutput] = useState("");
+  const terminal = useRef<TerminalHandle>(null);
+  const [terminalRunning, setTerminalRunning] = useState(false);
+  const current = useRef(workspace);
+  current.current = workspace;
+  const briefRef = useRef(brief);
+  briefRef.current = brief;
+  const inflight = useRef(false);
+  const activeRun = workspace?.runs.find((r) => r.status === "running");
+  const locked = busy || !!activeRun;
+  function assign(w: Workspace, restore = false) {
+    const previous = current.current;
+    if (previous?.id === w.id) {
+      const before = previous.artifacts.filter((a) => a.kind === "export").at(-1);
+      const after = w.artifacts.filter((a) => a.kind === "export").at(-1);
+      if (after && after.id !== before?.id) setSelectedOutput(after.id);
+    }
+    current.current = w;
+    setWorkspace(w);
+    const next = restore ? restoredBrief(w) : { ...w.brief };
+    if (!restore && previous?.id === w.id) {
+      // A tool progress event must not replace guidance the user is still editing.
+      for (const key of Object.keys(next) as (keyof Brief)[]) {
+        if (briefRef.current[key] !== previous.brief[key])
+          Object.assign(next, { [key]: briefRef.current[key] });
+      }
+      if (JSON.stringify(next) !== JSON.stringify(w.brief)) {
+        try { localStorage.setItem(draftKey(w.id), JSON.stringify({ brief: next, revision: w.revision })); }
+        catch { /* The next successful save still writes the native manifest. */ }
+      }
+    }
+    setBrief(next);
+    briefRef.current = next;
+  }
+  function editBrief(next: Brief) {
+    setBrief(next);
+    briefRef.current = next;
+    try {
+      localStorage.setItem(
+        draftKey(current.current?.id),
+        JSON.stringify({
+          brief: next,
+          revision: current.current?.revision || 0,
+        }),
+      );
+    } catch {
+      /* The native manifest remains the source of saved inputs. */
+    }
+  }
+  async function perform(action: () => Promise<void>) {
+    if (inflight.current) return;
+    inflight.current = true;
     setBusy(true);
     setError("");
-    setModalError("");
     try {
-      await fn();
+      await action();
     } catch (e) {
-      if (modal) setModalError(String(e));
-      else setError(String(e));
+      setError(describe(e));
     } finally {
+      inflight.current = false;
       setBusy(false);
     }
   }
   useEffect(() => {
-    if (!modal) return;
-    const form = workspaceDialog.current;
-    form?.querySelector<HTMLElement>('input, [role="tab"]')?.focus();
-    function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape" && !busyRef.current) {
-        event.preventDefault();
-        setModal(false);
-      }
-      if (event.key !== "Tab" || !form) return;
-      const controls = Array.from(
-        form.querySelectorAll<HTMLElement>(
-          "button:not(:disabled), input:not(:disabled)",
-        ),
-      ).filter((el) => el.offsetParent !== null && el.tabIndex >= 0);
-      const first = controls[0],
-        last = controls.at(-1);
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last?.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first?.focus();
-      }
-    }
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      workspaceTrigger.current?.focus();
-    };
-  }, [modal]);
-  function chooseWorkspaceMode(mode: "create" | "open") {
-    setWorkspaceMode(mode);
-    setFolder("");
-    setModalError("");
-  }
-  function addWorkspace() {
-    setWorkspaceMode("create");
-    setName("");
-    setFolder("");
-    setModalError("");
-    setModal(true);
-  }
-  useEffect(() => {
-    if (native) {
-      call<AppData>("app_data")
-        .then(setData)
-        .catch((e) => setError(String(e)));
-    }
-  }, []);
-  useEffect(() => {
-    localStorage.setItem("framecraft.language", lang);
-    document.documentElement.lang = lang === "en" ? "en" : "zh-CN";
-  }, [lang]);
-  useEffect(() => {
-    if (!notice) return;
-    const timer = setTimeout(() => setNotice(""), 3500);
-    return () => clearTimeout(timer);
-  }, [notice]);
-  useEffect(() => {
     if (!native) return;
     let disposed = false;
-    const unsub: (() => void)[] = [];
-    Promise.all([
-      listen<{ workspaceId: string; runId: string; line: string }>(
-        "run-log",
-        (e) => {
-          setLogs((old) => ({
-            ...old,
-            [e.payload.runId]: [
-              ...(old[e.payload.runId] || []),
-              e.payload.line,
-            ].slice(-600),
-          }));
-        },
-      ),
-      listen<{ workspaceId: string }>("workspace-updated", async (e) => {
-        const id = e.payload.workspaceId;
-        try {
-          const next = await call<Workspace>("get_workspace", { id });
-          if (workspaceRef.current?.id === id) {
-            assign(next);
-            const last = next.runs.at(-1);
-            if (last?.status === "succeeded" && last.artifactId) {
-              setArtifactId(last.artifactId);
-              setTab(
-                last.stage === "plan"
-                  ? "edit"
-                  : ["render", "voice", "image"].includes(last.stage)
-                    ? "outputs"
-                    : "study",
-              );
-            }
-          }
-          await refreshData();
-        } catch (err) {
-          setError(String(err));
+    const stops: (() => void)[] = [];
+    call<AppData>("app_data")
+      .then(async (app) => {
+        if (disposed) return;
+        setData(app);
+        if (app.recents[0]) {
+          const w = await call<Workspace>("get_workspace", {
+            id: app.recents[0].id,
+          });
+          if (!disposed) assign(w, true);
         }
-      }),
-    ])
-      .then((fns) => {
-        if (disposed) fns.forEach((f) => f());
-        else unsub.push(...fns);
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => {
+        if (!disposed) setError(describe(e));
+      })
+      .finally(() => {
+        if (!disposed) setBusy(false);
+      });
+    const subscribe = async () => {
+      for (const stop of await Promise.all([
+        listen<{ workspaceId: string }>("workspace-updated", async (e) => {
+          try {
+            const w = await call<Workspace>("get_workspace", {
+              id: e.payload.workspaceId,
+            });
+            if (!disposed && current.current?.id === w.id) assign(w);
+            const app = await call<AppData>("app_data");
+            if (!disposed) setData(app);
+          } catch (e) {
+            if (!disposed) setError(describe(e));
+          }
+        }),
+      ])) {
+        if (disposed) stop();
+        else stops.push(stop);
+      }
+    };
+    subscribe().catch((e) => setError(describe(e)));
     return () => {
       disposed = true;
-      unsub.forEach((f) => f());
+      stops.forEach((stop) => stop());
     };
   }, []);
-  async function persist(): Promise<Workspace> {
-    if (!w || !brief) throw new Error("No workspace selected");
-    if (!dirty) return w;
+  // Dropdown menus close on an outside click or Escape, like native menus.
+  useEffect(() => {
+    const dismiss = (e: Event) => {
+      document
+        .querySelectorAll<HTMLDetailsElement>("details.menu[open]")
+        .forEach((menu) => {
+          if (
+            e instanceof KeyboardEvent
+              ? e.key === "Escape"
+              : !menu.contains(e.target as Node)
+          )
+            menu.open = false;
+        });
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", dismiss);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", dismiss);
+    };
+  }, []);
+  // A completed native run is also recovered when the window regains focus.
+  useEffect(() => {
+    if (!native) return;
+    const refresh = () => {
+      const w = current.current;
+      if (w?.runs.some((r) => r.status === "running"))
+        call<Workspace>("get_workspace", { id: w.id })
+          .then(assign)
+          .catch((e) => setError(describe(e)));
+    };
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, []);
+  async function ensureWorkspace(): Promise<Workspace | null> {
+    if (current.current) return current.current;
+    const w = await call<Workspace>("create_workspace", {
+      name: "My video",
+      folder: null,
+    });
+    current.current = w;
+    setWorkspace(w);
+    setData(await call<AppData>("app_data"));
+    return w;
+  }
+  async function save(): Promise<Workspace | null> {
+    const w = await ensureWorkspace();
+    if (!w) return null;
+    const draft = briefRef.current;
+    if (
+      draft.duration < 5 ||
+      draft.duration > 600 ||
+      !Number.isFinite(draft.duration)
+    )
+      throw new Error("Set a target duration from 5 to 600 seconds.");
+    if (JSON.stringify(w.brief) === JSON.stringify(draft)) return w;
     const next = await call<Workspace>("save_brief", {
       id: w.id,
-      brief,
-      selectedSkills: selected,
+      brief: draft,
+      selectedSkills: w.selectedSkills,
     });
+    localStorage.removeItem(draftKey(w.id));
+    localStorage.removeItem(draftKey());
     assign(next);
     return next;
   }
-  async function switchWorkspace(id: string) {
+  async function importGuidance(kind: "reference" | "skill") {
     await perform(async () => {
-      if (dirty && !activeRun) await persist();
-      const next = await call<Workspace>("get_workspace", { id });
-      assign(next);
-      setArtifactId("");
-      setTab("brief");
-    });
-  }
-  async function importInput(
-    kind: "reference" | "raw" | "transcript" | "skill",
-    mediaId?: string,
-  ) {
-    await perform(async () => {
-      const current = await persist();
-      const path = await pick(
-        kind === "reference"
-          ? "video"
-          : kind === "raw"
-            ? "folder"
-            : kind === "transcript"
-              ? "transcript"
-              : "skill",
-      );
-      if (!path) return;
-      const command =
-        kind === "reference"
-          ? "import_reference"
-          : kind === "raw"
-            ? "import_raw_folder"
-            : kind === "transcript"
-              ? "attach_transcript"
-              : "import_skill";
-      assign(
-        await call<Workspace>(command, {
-          id: current.id,
-          ...(kind === "raw" ? { folder: path } : { path }),
-          ...(mediaId ? { mediaId } : {}),
-        }),
-      );
-      await refreshData();
-    });
-  }
-  async function start(stage: string, planId?: string) {
-    await perform(async () => {
-      const current = await persist();
-      const next = await call<Workspace>("start_run", {
-        id: current.id,
-        stage,
-        artifactId: planId || null,
-      });
-      assign(next);
-      setLogs((old) => ({ ...old, [next.runs.at(-1)!.id]: [] }));
-    });
-  }
-  async function reveal(path: string) {
-    await perform(async () => {
-      if (w) await call("reveal_path", { id: w.id, path });
-    });
-  }
-  function viewArtifact(a: Artifact) {
-    setArtifactId(a.id);
-    setTab(
-      a.kind === "plan"
-        ? "edit"
-        : a.kind === "analysis" || a.kind === "script"
-          ? "study"
-          : "outputs",
-    );
-  }
-  async function savePlan(id: string, plan: Plan) {
-    await perform(async () => {
+      const w = await save();
       if (!w) return;
-      const next = await call<Workspace>("save_plan", {
-        id: w.id,
-        artifactId: id,
-        plan,
-      });
-      assign(next);
-      setArtifactId(next.artifacts.at(-1)!.id);
-      setNotice(tr("savedPlan"));
+      const [path] = await pick(kind === "reference" ? "video" : "skill");
+      if (path)
+        assign(
+          await call<Workspace>(
+            kind === "reference" ? "import_reference" : "import_skill",
+            { id: w.id, path },
+          ),
+        );
     });
   }
-  const latest = (kind: string) =>
-    w?.artifacts.findLast((a) => a.kind === kind);
-  const workflow = [
-    {
-      n: "01",
-      title: tr("learn"),
-      sub: tr("learnSub"),
-      stage: "analyze",
-      action: tr("studyAction"),
-      done: !!latest("analysis"),
-      enabled: !!w?.reference,
-    },
-    {
-      n: "02",
-      title: tr("adapt"),
-      sub: tr("adaptSub"),
-      stage: "adapt",
-      action: tr("adaptAction"),
-      done: !!latest("script"),
-      enabled: !!latest("analysis") && !!brief?.topic.trim(),
-    },
-    {
-      n: "03",
-      title: tr("assemble"),
-      sub: tr("assembleSub"),
-      stage: "plan",
-      action: tr("planAction"),
-      done: !!latest("plan"),
-      enabled:
-        !!latest("analysis") &&
-        !!w?.media.some((m) => m.kind === "video") &&
-        !!brief?.topic.trim(),
-    },
-    {
-      n: "04",
-      title: tr("export"),
-      sub: tr("exportSub"),
-      stage: "render",
-      action: tr("reviewPlan"),
-      done: !!latest("export"),
-      enabled: !!latest("plan"),
-    },
-  ];
+  async function chooseAssetsFolder() {
+    await perform(async () => {
+      const [folder] = await pick("folder");
+      if (!folder) return;
+      if (current.current) {
+        await call("terminal_close", { id: current.current.id });
+        setTerminalRunning(false);
+      }
+      if (current.current) await save();
+      const draft = briefRef.current;
+      const next = await call<Workspace>("set_assets_folder", {
+        id: current.current?.id || null,
+        folder,
+      });
+      assign(next);
+      editBrief(draft);
+      setData(await call<AppData>("app_data"));
+    });
+  }
+  function removeInput(mediaId: string) {
+    void perform(async () => {
+      const w = await save();
+      if (w)
+        assign(await call<Workspace>("remove_input", { id: w.id, mediaId }));
+    });
+  }
+  function changeSkills(ids: string[]) {
+    void perform(async () => {
+      const w = await save();
+      if (w)
+        assign(
+          await call<Workspace>("save_brief", {
+            id: w.id,
+            brief: briefRef.current,
+            selectedSkills: ids,
+          }),
+        );
+    });
+  }
+  function changeWorkspace(id: string) {
+    void perform(async () => {
+      if (current.current) {
+        await call("terminal_close", { id: current.current.id });
+        setTerminalRunning(false);
+        await save();
+      }
+      assign(await call<Workspace>("get_workspace", { id }), true);
+      setSelectedOutput("");
+    });
+  }
+  function openWorkspace(create: boolean) {
+    void perform(async () => {
+      if (current.current) await save();
+      const [folder] = await pick("folder");
+      if (!folder) return;
+      if (current.current) {
+        await call("terminal_close", { id: current.current.id });
+        setTerminalRunning(false);
+      }
+      const w = await call<Workspace>(
+        create ? "create_workspace" : "open_workspace",
+        create
+          ? {
+              name:
+                folder.split(/[\\/]/).filter(Boolean).at(-1) ||
+                "Untitled video",
+              folder,
+            }
+          : { folder },
+      );
+      assign(w, true);
+      setSelectedOutput("");
+      setData(await call<AppData>("app_data"));
+    });
+  }
+  async function saveSettings(
+    settings: Settings,
+    keys: Record<string, string>,
+  ) {
+    if (current.current) {
+      await call("terminal_close", { id: current.current.id });
+      setTerminalRunning(false);
+    }
+    const saved = await call<Settings>("save_settings", {
+      settings,
+      apiKey: null,
+      providerKeys: keys,
+    });
+    setData((old) => ({ ...old, settings: saved }));
+  }
+  async function openTerminal(): Promise<boolean> {
+    if (connectionPending) return false;
+    return await terminal.current?.open() || false;
+  }
+  useEffect(() => {
+    if (!native || !workspace) return;
+    void call("terminal_context", { id: workspace.id, selected: selectedOutput }).catch((e) => setError(describe(e)));
+  }, [workspace?.id, selectedOutput]);
+  // Keep the live goal available to tools used from the terminal.
+  useEffect(() => {
+    if (!terminalRunning || busy || activeRun || !workspace || JSON.stringify(brief) === JSON.stringify(workspace.brief)) return;
+    const timer = window.setTimeout(() => { void save().catch((e) => setError(describe(e))); }, 600);
+    return () => window.clearTimeout(timer);
+  }, [brief, terminalRunning, busy, activeRun, workspace]);
+  const missing = !brief.topic.trim()
+    ? workspace?.assetsFolder
+      ? "Describe your goal to continue."
+      : "Add a goal and an assets folder to continue."
+    : !workspace?.assetsFolder
+      ? "Choose an assets folder to continue."
+      : "";
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">
-            <span />
-            <span />
-            <span />
-          </div>
-          <div>
-            <strong>
-              framecraft<span>®</span>
-            </strong>
-            <small>{tr("studio")}</small>
-          </div>
-        </div>
-        <div className="side-heading">
-          <span>{tr("workspaces")}</span>
-        </div>
-        <button
-          ref={workspaceTrigger}
-          className="workspace-add"
-          disabled={busy}
-          onClick={addWorkspace}
-        >
-          <Plus size={16} />
-          {tr("addWorkspace")}
-        </button>
-        <div className="workspace-list">
-          {data.recents.map((r) => (
+      <header className="topbar">
+        <a className="brand" href="#" onClick={(e) => e.preventDefault()}>
+          <span className="brand-mark" aria-hidden="true">
+            <Clapperboard size={15} strokeWidth={2.2} />
+          </span>
+          Framecraft
+        </a>
+        <details className="workspace-menu menu">
+          <summary>
+            <span className="workspace-name">
+              {workspace?.name || "My first video"}
+            </span>
+            <ChevronDown size={15} />
+          </summary>
+          <div className="workspace-options">
             <button
-              key={r.id}
-              disabled={busy}
-              className={`workspace-item ${w?.id === r.id ? "active" : ""}`}
-              onClick={() => switchWorkspace(r.id)}
+              disabled={locked}
+              onClick={(e) => {
+                e.currentTarget.closest("details")?.removeAttribute("open");
+                openWorkspace(true);
+              }}
             >
-              <Folder size={17} />
-              <span>{r.name}</span>
-              {w?.id === r.id ? <span className="current-dot" /> : null}
+              <Plus size={16} />
+              New workspace
             </button>
-          ))}
-          {!data.recents.length ? (
-            <div className="no-workspace">{tr("welcomeNote")}</div>
-          ) : null}
-        </div>
-        <div className="side-separator" />
-        {w ? (
-          <nav>
-            {tabs.map(([id, Icon]) => (
+            <button
+              disabled={locked}
+              onClick={(e) => {
+                e.currentTarget.closest("details")?.removeAttribute("open");
+                openWorkspace(false);
+              }}
+            >
+              <FolderOpen size={16} />
+              Open workspace
+            </button>
+            {data.recents.map((r) => (
               <button
-                key={id}
-                className={`nav-item ${tab === id ? "active" : ""}`}
-                onClick={() => setTab(id)}
+                className={workspace?.id === r.id ? "selected" : ""}
+                key={r.id}
+                disabled={locked}
+                onClick={(e) => {
+                  e.currentTarget.closest("details")?.removeAttribute("open");
+                  changeWorkspace(r.id);
+                }}
               >
-                <Icon size={18} />
-                {tr(id)}
-                {id === "outputs" && w.artifacts.length ? (
-                  <span className="nav-count">{w.artifacts.length}</span>
-                ) : null}
+                {r.name}
               </button>
             ))}
-          </nav>
-        ) : (
-          <div className="side-illustration">
-            <div />
-            <div />
-            <div />
-            <span>REF → REFRAME</span>
           </div>
-        )}
-        <div className="side-bottom">
+        </details>
+        <button
+          className="settings-button"
+          aria-label="Settings"
+          disabled={locked}
+          onClick={() => setSettingsOpen(true)}
+        >
+          <Settings2 size={17} />
+          <span>Settings</span>
+        </button>
+      </header>
+      {error ? (
+        <div className="error-banner" role="alert">
+          <span>{error}</span>
           <button
-            className={`nav-item ${tab === "settings" ? "active" : ""}`}
-            onClick={() => setTab("settings")}
+            className="icon-button"
+            aria-label="Dismiss error"
+            onClick={() => setError("")}
           >
-            <Settings2 size={18} />
-            {tr("settings")}
+            <X size={16} />
           </button>
-          <div className="local-note">
-            <span className="current-dot" />
-            <div>
-              <strong>{tr("localFirst")}</strong>
-              <small>{tr("localSub")}</small>
-            </div>
+        </div>
+      ) : null}
+      <main className="studio-layout">
+        <div className="composer">
+          <Guidance
+            brief={brief}
+            workspace={workspace}
+            disabled={locked}
+            onChange={editBrief}
+            onImport={importGuidance}
+            onRemove={removeInput}
+            onSkills={changeSkills}
+          />
+          <div className="assets-section">
+            <Assets
+              folder={workspace?.assetsFolder || null}
+              disabled={locked}
+              narration={brief.narration}
+              onNarration={(narration) => editBrief({ ...brief, narration })}
+              onChoose={() => void chooseAssetsFolder()}
+            />
+          </div>
+          <div className="create-area">
+            {activeRun ? (
+              <button
+                className="outline-button stop-button"
+                onClick={() =>
+                  void perform(async () => {
+                    await call("cancel_run", { id: workspace!.id });
+                  })
+                }
+                disabled={busy}
+              >
+                <LoaderCircle size={17} className="spin" />
+                Stop generation
+              </button>
+            ) : (
+              <button
+                className="primary-button create-button"
+                disabled={
+                  busy || connectionPending || !brief.topic.trim() || !workspace?.assetsFolder
+                }
+                onClick={() => void openTerminal()}
+              >
+                {busy ? <LoaderCircle size={17} className="spin" /> : null}
+                {terminalRunning ? "Continue in terminal" : "Open Claude Code"}
+              </button>
+            )}
+            {!activeRun && missing ? (
+              <p className="create-hint">{missing}</p>
+            ) : null}
           </div>
         </div>
-      </aside>
-      <main className="main-shell">
-        <header className="topbar">
-          <div className="breadcrumb">
-            <span>{tr("workspace")}</span>
-            <span>/</span>
-            <strong>
-              {tab === "settings" ? tr("settings") : w?.name || "Framecraft"}
-            </strong>
-          </div>
-          <div className="top-actions">
-            <button
-              className="language-switch"
-              onClick={() => setLang(lang === "en" ? "zh" : "en")}
-              aria-label="Switch language"
-            >
-              <Globe size={14} />
-              {lang === "en" ? "中文" : "English"}
-            </button>
-            {w && tab !== "settings" ? (
-              <button
-                className={`save-button ${dirty ? "dirty" : ""}`}
-                disabled={!dirty || locked}
-                onClick={() =>
-                  perform(async () => {
-                    await persist();
-                    setNotice(tr("savedBrief"));
-                  })
-                }
-              >
-                {busy ? (
-                  <LoaderCircle size={14} className="spin" />
-                ) : dirty ? (
-                  <span className="dirty-dot" />
-                ) : (
-                  <Check size={14} />
-                )}{" "}
-                {tr(dirty ? "save" : "saved")}
-              </button>
-            ) : null}
-          </div>
-        </header>
-        {!native ? (
-          <div className="preview-banner">{tr("browserNote")}</div>
-        ) : null}
-        {error ? (
-          <div role="alert" className="error-banner">
-            <TriangleAlert size={18} />
-            <div>
-              <strong>{tr("error")}</strong>
-              <p>{error}</p>
-            </div>
-            <button
-              className="icon-btn"
-              aria-label={tr("dismiss")}
-              onClick={() => setError("")}
-            >
-              <X size={17} />
-            </button>
-          </div>
-        ) : null}
-        {notice ? (
-          <div role="status" className="toast">
-            <Check size={16} />
-            {notice}
-          </div>
-        ) : null}
-        <div
-          className={`content-layout ${w && tab !== "settings" ? "with-rail" : ""}`}
-        >
-          <section className="page-content">
-            {tab === "settings" ? (
-              <SettingsView
-                lang={lang}
-                settings={data.settings}
-                busy={busy}
-                perform={perform}
-                onSave={async (settings) => {
-                  setData((d) => ({ ...d, settings }));
-                  setNotice(tr("savedSettings"));
-                }}
-              />
-            ) : !w ? (
-              <div className="welcome">
-                <div className="welcome-glyph">
-                  <div />
-                  <div />
-                  <div />
-                  <span>
-                    <Clapperboard size={48} strokeWidth={1} />
-                  </span>
-                </div>
-                <h1>{tr("welcomeTitle")}</h1>
-                <p>{tr("welcomeSub")}</p>
-                <p className="welcome-start">
-                  {tr(data.recents.length ? "welcomeChoose" : "welcomeStart")}
-                </p>
-                <div className="welcome-flow">
-                  {workflow.map((s, i) => (
-                    <div key={s.n}>
-                      <span className="step-number">{s.n}</span>
-                      <strong>{s.title}</strong>
-                      <small>{s.sub}</small>
-                      {i < 3 ? <ArrowRight size={16} /> : null}
-                    </div>
-                  ))}
-                </div>
-                <div className="welcome-foot">
-                  <Folder size={14} />
-                  {tr("welcomeNote")}
-                </div>
-              </div>
-            ) : tab === "brief" && brief ? (
-              <BriefView
-                lang={lang}
-                w={w}
-                brief={brief}
-                setBrief={setBrief}
-                locked={locked}
-                importInput={importInput}
-                reveal={reveal}
-                refresh={() =>
-                  perform(async () => {
-                    const current = await persist();
-                    assign(
-                      await call<Workspace>("import_raw_folder", {
-                        id: current.id,
-                        folder: current.rawFolder,
-                      }),
-                    );
-                  })
-                }
-              />
-            ) : tab === "study" ? (
-              <StudyView
-                lang={lang}
-                w={w}
-                artifactId={artifactId}
-                setArtifactId={setArtifactId}
-                locked={locked}
-                start={start}
-                goBrief={() => setTab("brief")}
-              />
-            ) : tab === "edit" ? (
-              <EditView
-                lang={lang}
-                w={w}
-                artifactId={artifactId}
-                setArtifactId={setArtifactId}
-                locked={locked}
-                start={start}
-                savePlan={savePlan}
-                goBrief={() => setTab("brief")}
-                attach={(id) => importInput("transcript", id)}
-              />
-            ) : tab === "skills" ? (
-              <SkillsView
-                lang={lang}
-                w={w}
-                selected={selected}
-                setSelected={setSelected}
-                locked={locked}
-                importSkill={() => importInput("skill")}
-              />
-            ) : tab === "outputs" ? (
-              <OutputsView
-                lang={lang}
-                w={w}
-                view={viewArtifact}
-                settings={data.settings.generation}
-                locked={locked}
-                generate={(kind, prompt) =>
-                  perform(async () => {
-                    assign(
-                      await call<Workspace>("generate_asset", {
-                        id: w.id,
-                        kind,
-                        prompt,
-                      }),
-                    );
-                  })
-                }
-                configure={() => setTab("settings")}
-                reveal={reveal}
-              />
-            ) : tab === "runs" ? (
-              <RunsView
-                lang={lang}
-                w={w}
-                logs={logs}
-                locked={locked}
-                start={start}
-                view={viewArtifact}
-              />
-            ) : null}
-          </section>
-          {w && tab !== "settings" ? (
-            <aside className="workflow-rail">
-              <div className="rail-heading">
-                <span>{tr("workflow")}</span>
-                <Sparkles size={15} />
-              </div>
-              <div className="workflow-steps">
-                {workflow.map((s) => (
-                  <div
-                    key={s.n}
-                    className={`workflow-step ${s.done ? "done" : ""} ${activeRun?.stage === s.stage ? "live" : ""}`}
-                  >
-                    <div className="step-dot">
-                      {activeRun?.stage === s.stage ? (
-                        <LoaderCircle size={14} className="spin" />
-                      ) : s.done ? (
-                        <Check size={14} />
-                      ) : (
-                        s.n
-                      )}
-                    </div>
-                    <div>
-                      <strong>{s.title}</strong>
-                      <p>{s.sub}</p>
-                      {s.stage === "render" ? (
-                        <button
-                          className="step-action"
-                          disabled={locked || !s.enabled}
-                          onClick={() => {
-                            setTab("edit");
-                            setArtifactId(latest("plan")!.id);
-                          }}
-                        >
-                          {s.action}
-                          <ArrowUpRight size={14} />
-                        </button>
-                      ) : (
-                        <button
-                          className="step-action"
-                          disabled={locked || !s.enabled}
-                          onClick={() => start(s.stage)}
-                        >
-                          {s.action}
-                          <ArrowRight size={14} />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div className="agent-panel">
-                <div className="agent-header">
-                  <span className={activeRun ? "pulse-dot" : "idle-dot"} />
-                  <strong>{tr("activity")}</strong>
-                  {activeRun ? (
-                    <span className="running-label">{tr("running")}</span>
-                  ) : null}
-                </div>
-                <div className="agent-log" aria-live="polite">
-                  {activeRun ? (
-                    (logs[activeRun.id] || []).slice(-8).map((l, i) => (
-                      <p key={i}>
-                        <span>›</span>
-                        {l}
-                      </p>
-                    ))
-                  ) : w.runs.at(-1) ? (
-                    <>
-                      <div className={`status ${w.runs.at(-1)!.status}`}>
-                        {tr(w.runs.at(-1)!.status as Key)}
-                      </div>
-                      <p>{w.runs.at(-1)!.message}</p>
-                    </>
-                  ) : (
-                    <p className="empty-log">{tr("activityEmpty")}</p>
-                  )}
-                </div>
-                {activeRun ? (
-                  <button
-                    className="stop-button"
-                    onClick={() =>
-                      perform(async () => {
-                        await call("cancel_run", { id: w.id });
-                      })
-                    }
-                  >
-                    <span />
-                    {tr("stop")}
-                  </button>
-                ) : null}
-              </div>
-              <button
-                className="workspace-location"
-                onClick={() => reveal(w.root)}
-                title={w.root}
-              >
-                <FolderOpen size={16} />
-                <span>
-                  {w.name}
-                  <small>{w.root}</small>
-                </span>
-                <ArrowUpRight size={14} />
-              </button>
-            </aside>
+        <div className="result-column">
+          <Result
+            artifacts={workspace?.artifacts || []}
+            aspect={brief.aspect}
+            active={!!activeRun}
+            selected={selectedOutput}
+            onSelect={setSelectedOutput}
+            onReveal={(path) =>
+              void perform(async () => {
+                await call("reveal_path", { id: workspace!.id, path });
+              })
+            }
+          />
+          {!native ? (
+            <p className="browser-note">
+              Desktop preview · Open Framecraft to create videos
+            </p>
           ) : null}
         </div>
+        <TerminalPanel
+          ref={terminal}
+          workspace={workspace}
+          settings={data.settings}
+          disabled={locked}
+          onPrepare={save}
+          onSaveConnection={saveSettings}
+          onConnectionPending={setConnectionPending}
+          onRunning={setTerminalRunning}
+          onInstalled={async () => { setData(await call<AppData>("app_data")); }}
+        />
       </main>
-      {modal ? (
-        <div
-          className="modal-backdrop"
-          onClick={() => !busy && setModal(false)}
-        >
-          <form
-            className="modal"
-            ref={workspaceDialog}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="workspace-dialog-title"
-            onClick={(e) => e.stopPropagation()}
-            onSubmit={(e) => {
-              e.preventDefault();
-              perform(async () => {
-                if (dirty && !activeRun) await persist();
-                assign(
-                  workspaceMode === "create"
-                    ? await call<Workspace>("create_workspace", {
-                        name,
-                        folder,
-                      })
-                    : await call<Workspace>("open_workspace", { folder }),
-                );
-                setModal(false);
-                setName("");
-                setFolder("");
-                setTab("brief");
-                setArtifactId("");
-                await refreshData();
-              });
-            }}
-          >
-            <div className="modal-heading">
-              <div className="modal-icon">
-                <FolderOpen size={24} />
-              </div>
-              <button
-                type="button"
-                className="icon-btn"
-                aria-label={tr("close")}
-                disabled={busy}
-                onClick={() => setModal(false)}
-              >
-                <X size={20} />
-              </button>
-            </div>
-            <h2 id="workspace-dialog-title">{tr("addWorkspace")}</h2>
-            <div
-              className="workspace-modes"
-              role="tablist"
-              aria-label={tr("workspaceAction")}
-            >
-              {(["create", "open"] as const).map((mode) => (
-                <button
-                  key={mode}
-                  type="button"
-                  role="tab"
-                  aria-selected={workspaceMode === mode}
-                  aria-controls="workspace-panel"
-                  id={`workspace-${mode}-tab`}
-                  disabled={busy}
-                  tabIndex={workspaceMode === mode ? 0 : -1}
-                  onClick={() => chooseWorkspaceMode(mode)}
-                  onKeyDown={(e) => {
-                    if (
-                      !["ArrowLeft", "ArrowRight", "Home", "End"].includes(
-                        e.key,
-                      )
-                    )
-                      return;
-                    e.preventDefault();
-                    const next =
-                      e.key === "Home"
-                        ? "create"
-                        : e.key === "End"
-                          ? "open"
-                          : mode === "create"
-                            ? "open"
-                            : "create";
-                    chooseWorkspaceMode(next);
-                    workspaceDialog.current
-                      ?.querySelector<HTMLButtonElement>(
-                        `#workspace-${next}-tab`,
-                      )
-                      ?.focus();
-                  }}
-                >
-                  {tr(mode === "create" ? "createNew" : "openExisting")}
-                </button>
-              ))}
-            </div>
-            <div
-              id="workspace-panel"
-              role="tabpanel"
-              aria-labelledby={`workspace-${workspaceMode}-tab`}
-            >
-              <p className="workspace-mode-note">
-                {tr(workspaceMode === "create" ? "createNote" : "openNote")}
-              </p>
-              {workspaceMode === "create" ? (
-                <label>
-                  {tr("name")}
-                  <input
-                    required
-                    disabled={busy}
-                    maxLength={120}
-                    placeholder={tr("namePlaceholder")}
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                  />
-                </label>
-              ) : null}
-              <label>
-                {tr("folder")}
-                <button
-                  type="button"
-                  className="folder-picker"
-                  disabled={busy}
-                  onClick={() =>
-                    perform(async () => {
-                      const p = await pick("folder");
-                      if (p) {
-                        setFolder(p);
-                        if (workspaceMode === "create" && !name.trim())
-                          setName(
-                            (
-                              p.split(/[\\/]/).filter(Boolean).at(-1) || ""
-                            ).slice(0, 120),
-                          );
-                      }
-                    })
-                  }
-                >
-                  <FolderOpen size={18} />
-                  <span>{folder || tr("chooseFolder")}</span>
-                  <ArrowUpRight size={16} />
-                </button>
-              </label>
-            </div>
-            {modalError ? (
-              <p className="modal-error" role="alert">
-                <TriangleAlert size={16} />
-                {modalError}
-              </p>
-            ) : null}
-            <div className="modal-actions">
-              <button
-                type="button"
-                className="secondary"
-                disabled={busy}
-                onClick={() => setModal(false)}
-              >
-                {tr("cancel")}
-              </button>
-              <button
-                className="primary"
-                disabled={
-                  busy ||
-                  !folder ||
-                  (workspaceMode === "create" && !name.trim())
-                }
-              >
-                {busy ? (
-                  <LoaderCircle size={17} className="spin" />
-                ) : workspaceMode === "create" ? (
-                  <Plus size={17} />
-                ) : (
-                  <FolderOpen size={17} />
-                )}{" "}
-                {tr(workspaceMode === "create" ? "create" : "openWorkspace")}
-              </button>
-            </div>
-          </form>
-        </div>
+      {settingsOpen ? (
+        <SettingsView
+          settings={data.settings}
+          onSave={saveSettings}
+          onClose={() => setSettingsOpen(false)}
+        />
       ) : null}
     </div>
   );
