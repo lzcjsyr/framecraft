@@ -233,9 +233,10 @@ pub async fn terminal_open(
             "VOLCENGINE_API_KEY",
             "GOOGLE_CLOUD_API_KEY",
             "GOOGLE_APPLICATION_CREDENTIALS",
-            "CLAUDECODE",
-            "CLAUDE_CODE_ENTRYPOINT",
         ] {
+            cmd.env_remove(name);
+        }
+        for name in tools::inherited_claude_markers() {
             cmd.env_remove(name);
         }
         for (key, value) in env.get_envs() {
@@ -375,8 +376,6 @@ fn install_command() -> Result<std::process::Command, String> {
         "AGENT_API_KEY",
         "VOLCENGINE_API_KEY",
         "GOOGLE_CLOUD_API_KEY",
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
     ] {
         cmd.env_remove(name);
     }

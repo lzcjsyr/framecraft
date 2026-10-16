@@ -3,6 +3,10 @@ import { Check, LoaderCircle } from "lucide-react";
 import { call, describe, native } from "./api";
 import { Modal } from "./Modal";
 import type { AdcStatus, Diagnostics, Settings } from "./types";
+const geminiModels = [
+  ["gemini-3.1-flash-image", "Gemini 3.1 Flash Image"],
+  ["gemini-nano-banana-2.1", "Nano Banana 2.1"],
+] as const;
 export function SettingsView({
   settings,
   onClose,
@@ -20,6 +24,8 @@ export function SettingsView({
         settings.generation.imageProvider === "google"
           ? "google_adc"
           : settings.generation.imageProvider,
+      // The project now always comes from the ADC login's quota project.
+      googleProject: "",
     },
   });
   const [keys, setKeys] = useState<Record<string, string>>({});
@@ -172,28 +178,38 @@ export function SettingsView({
                 />
               </label>
             ) : (
-              <>
-                <label>
-                  Google Cloud project
-                  <input
-                    value={generation.googleProject}
-                    placeholder="Use the project from your ADC login"
-                    onChange={(e) => update("googleProject", e.target.value)}
-                  />
-                </label>
-                <p className="help-text">
-                  Uses your local{" "}
-                  <code>gcloud auth application-default login</code>.
-                </p>
-              </>
+              <p className="help-text">
+                Uses your local{" "}
+                <code>gcloud auth application-default login</code> and its
+                quota project.
+              </p>
             )}
             <label>
               Image model
-              <input
-                required
-                value={generation.imageModel}
-                onChange={(e) => update("imageModel", e.target.value)}
-              />
+              {generation.imageProvider === "doubao" ? (
+                <input
+                  required
+                  value={generation.imageModel}
+                  onChange={(e) => update("imageModel", e.target.value)}
+                />
+              ) : (
+                <select
+                  value={generation.imageModel}
+                  onChange={(e) => update("imageModel", e.target.value)}
+                >
+                  {geminiModels.map(([id, name]) => (
+                    <option key={id} value={id}>
+                      {name}
+                    </option>
+                  ))}
+                  {/* Keep a previously saved model visible until it is changed. */}
+                  {geminiModels.some(([id]) => id === generation.imageModel) ? null : (
+                    <option value={generation.imageModel}>
+                      {generation.imageModel}
+                    </option>
+                  )}
+                </select>
+              )}
             </label>
           </div>
           <details className="advanced-settings">

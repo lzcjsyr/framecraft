@@ -84,7 +84,7 @@ pub async fn request(
     let request = if s.image_provider == "google_adc" {
         let adc = crate::credentials::adc()?;
         let project = crate::credentials::adc_project(&adc, &s.google_project)?
-            .ok_or("Enter your Google Cloud project ID in Settings")?;
+            .ok_or("Your Google ADC login has no quota project. Run: gcloud auth application-default set-quota-project PROJECT_ID")?;
         secret = crate::credentials::refresh_adc(&client, &adc).await?.token;
         client.post(format!("https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/publishers/google/models/{}:generateContent",s.image_model))
             .bearer_auth(&secret).header("x-goog-user-project",project)

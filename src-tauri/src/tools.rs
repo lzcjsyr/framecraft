@@ -275,8 +275,23 @@ pub fn cli_update_command(program: &Path) -> Result<Command, String> {
     cmd.arg("update");
     Ok(cmd)
 }
+/// Session markers a parent Claude Code leaves in this app's environment, e.g. when
+/// Framecraft is launched from a Claude Code terminal. A child CLI that inherits them
+/// treats itself as a subagent session and disables transcript saving.
+pub fn inherited_claude_markers() -> Vec<std::ffi::OsString> {
+    std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            name.to_str()
+                .is_some_and(|n| n == "CLAUDECODE" || n.starts_with("CLAUDE_CODE_"))
+        })
+        .collect()
+}
 pub fn clean_provider(c: &mut Command) {
     for name in PROVIDER_ENV {
+        c.env_remove(name);
+    }
+    for name in inherited_claude_markers() {
         c.env_remove(name);
     }
 }
